@@ -1957,10 +1957,10 @@ async fn run_turn(
             tools: tools.clone(),
             base_instructions_override: sess.base_instructions.clone(),
             environment_context: Some(EnvironmentContext::new(
-                sess.cwd.clone(),
-                sess.approval_policy,
-                sess.sandbox_policy.clone(),
-                sess.user_shell.clone(),
+                Some(sess.cwd.clone()),
+                Some(sess.approval_policy),
+                Some(sess.sandbox_policy.clone()),
+                Some(sess.user_shell.clone()),
             )),
             status_items, // Include status items with this request
         };

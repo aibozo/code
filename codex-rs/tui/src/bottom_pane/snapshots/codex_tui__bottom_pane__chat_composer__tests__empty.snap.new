@@ -1,0 +1,15 @@
+---
+source: tui/src/bottom_pane/chat_composer.rs
+assertion_line: 1711
+expression: terminal.backend()
+---
+"┌──────────────────────────────────────── compression off ─────────────────────────────────────────┐"
+"│ Welcome to Code — What are we coding today? Type / to see commands                               │"
+"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+"                                                             Ctrl+X compression off  •  Ctrl+C quit "
+"                                                                                                    "
+"                                                                                                    "
+"                                                                                                    "
+"                                                                                                    "
+"                                                                                                    "
+"                                                                                                    "

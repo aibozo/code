@@ -107,9 +107,9 @@ async fn prefixes_context_and_instructions_once_and_consistently_across_requests
     assert_eq!(input1[1]["role"], serde_json::json!("user"));
     let env_text = input1[1]["content"][0]["text"].as_str().unwrap_or("");
     assert!(env_text.starts_with("<environment_context>"));
-    assert!(env_text.contains("\"approval_policy\": \"on-request\""));
-    assert!(env_text.contains("\"sandbox_mode\": \"read-only\""));
-    assert!(env_text.contains("\"network_access\": \"restricted\""));
+    assert!(env_text.contains("<approval_policy>on-request</approval_policy>"));
+    assert!(env_text.contains("<sandbox_mode>read-only</sandbox_mode>"));
+    assert!(env_text.contains("<network_access>restricted</network_access>"));
     // 2: user instructions
     assert_eq!(input1[2]["role"], serde_json::json!("user"));
     let ui_text = input1[2]["content"][0]["text"].as_str().unwrap_or("");
@@ -261,8 +261,8 @@ async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() {
     assert_eq!(body2["input"][0], body1["input"][0]);
     assert_ne!(body2["input"][1], body1["input"][1]);
     let env2_text = body2["input"][1]["content"][0]["text"].as_str().unwrap_or("");
-    assert!(env2_text.contains("workspace-write"));
-    assert!(env2_text.contains("\"network_access\": \"enabled\""));
+    assert!(env2_text.contains("<sandbox_mode>workspace-write</sandbox_mode>"));
+    assert!(env2_text.contains("<network_access>enabled</network_access>"));
     assert_eq!(body2["input"][2], body1["input"][2]);
     assert!(
         body2["input"].as_array().unwrap().iter().any(|v| v == &expected_user_message_2),
