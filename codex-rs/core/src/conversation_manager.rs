@@ -40,7 +40,14 @@ impl Default for ConversationManager {
 
 impl ConversationManager {
     pub async fn new_conversation(&self, config: Config) -> CodexResult<NewConversation> {
-        let auth = CodexAuth::from_codex_home(&config.codex_home, codex_login::AuthMode::ApiKey)?;
+        // Choose auth mode based on configuration: when ChatGPT auth is
+        // available (user signed in), prefer it for main model calls.
+        // Embeddings continue to use API key internally.
+        let auth = if config.using_chatgpt_auth {
+            CodexAuth::from_codex_home(&config.codex_home, codex_login::AuthMode::ChatGPT)?
+        } else {
+            CodexAuth::from_codex_home(&config.codex_home, codex_login::AuthMode::ApiKey)?
+        };
         self.new_conversation_with_auth(config, auth).await
     }
 

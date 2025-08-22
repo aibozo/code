@@ -1,13 +1,15 @@
 #![cfg(feature = "vt100-tests")]
 
 use ratatui::backend::TestBackend;
+use ratatui::Terminal;
+use ratatui::TerminalOptions;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 
 #[test]
 fn live_001_commit_on_overflow() {
     let backend = TestBackend::new(20, 6);
-    let mut term = match codex_tui::custom_terminal::Terminal::with_options(backend) {
+    let mut term = match Terminal::with_options(backend, TerminalOptions::default()) {
         Ok(t) => t,
         Err(e) => panic!("failed to construct terminal: {e}"),
     };
@@ -64,7 +66,7 @@ fn live_001_commit_on_overflow() {
 #[test]
 fn live_002_pre_scroll_and_commit() {
     let backend = TestBackend::new(20, 6);
-    let mut term = match codex_tui::custom_terminal::Terminal::with_options(backend) {
+    let mut term = match Terminal::with_options(backend, TerminalOptions::default()) {
         Ok(t) => t,
         Err(e) => panic!("failed to construct terminal: {e}"),
     };

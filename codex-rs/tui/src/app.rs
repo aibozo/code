@@ -187,6 +187,30 @@ impl App<'_> {
             );
             // Check for initial animations after widget is created
             chat_widget.check_for_initial_animations();
+            // If embeddings are enabled but no API key is configured, show a friendly notice.
+            if config.memory.enabled && config.memory.embedding.enabled {
+                if !codex_core::memory::openai_embeddings::has_openai_api_key(&config.codex_home) {
+                    use ratatui::text::{Line, Span};
+                    use ratatui::style::{Style, Modifier};
+                    use ratatui::style::Stylize;
+                    let mut lines: Vec<Line<'static>> = Vec::new();
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(vec![
+                        Span::raw("Memory: "),
+                        Span::styled("Embeddings enabled, but no OpenAI API key found", Style::default().add_modifier(Modifier::BOLD)),
+                    ]));
+                    lines.push(Line::from("  To enable semantic retrieval, add your API key:"));
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        // Styled as a command hint
+                        "code login --api-key sk-...".to_string().cyan(),
+                        Span::raw("  (saved to ~/.codex/auth.json)"),
+                    ]));
+                    lines.push(Line::from("  Alternatively set OPENAI_API_KEY before launching Code."));
+                    lines.push(Line::from(""));
+                    chat_widget.push_notice_lines(lines);
+                }
+            }
             AppState::Chat {
                 widget: Box::new(chat_widget),
             }
@@ -364,6 +388,31 @@ impl App<'_> {
                             }
                         }
                         KeyEvent {
+                            code: KeyCode::Char('x'),
+                            modifiers: crossterm::event::KeyModifiers::CONTROL,
+                            kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                            ..
+                        } => {
+                            // Toggle semantic compression (memory)
+                            match &mut self.app_state {
+                                AppState::Chat { widget } => {
+                                    widget.toggle_compression(self.enhanced_keys_supported);
+                                }
+                                AppState::Onboarding { .. } => {}
+                            }
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('i'),
+                            modifiers: crossterm::event::KeyModifiers::CONTROL,
+                            kind: KeyEventKind::Press,
+                            ..
+                        } => {
+                            // Toggle visibility of memory/code injection notices
+                            if let AppState::Chat { widget } = &mut self.app_state {
+                                widget.toggle_injection_notices();
+                            }
+                        }
+                        KeyEvent {
                             code: KeyCode::Char('d'),
                             modifiers: crossterm::event::KeyModifiers::CONTROL,
                             kind: KeyEventKind::Press,
@@ -514,6 +563,11 @@ impl App<'_> {
                         SlashCommand::Perf => {
                             if let AppState::Chat { widget } = &mut self.app_state {
                                 widget.handle_perf_command(command_args);
+                            }
+                        }
+                        SlashCommand::Memory => {
+                            if let AppState::Chat { widget } = &mut self.app_state {
+                                widget.handle_memory_command(command_args);
                             }
                         }
                         // Prompt-expanding commands should have been handled in submit_user_message
@@ -836,18 +890,18 @@ fn should_show_login_screen(login_status: crate::LoginStatus, _config: &Config) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::LoginStatus;
     use codex_core::config::ConfigOverrides;
     use codex_core::config::ConfigToml;
     use codex_login::AuthMode;
 
-    fn make_config(preferred: AuthMode) -> Config {
-        let mut cfg = Config::load_from_base_config_with_overrides(
+    fn make_config(_preferred: AuthMode) -> Config {
+        let cfg = Config::load_from_base_config_with_overrides(
             ConfigToml::default(),
             ConfigOverrides::default(),
             std::env::temp_dir(),
         )
         .expect("load default config");
-        cfg.preferred_auth_method = preferred;
         cfg
     }
 
@@ -861,9 +915,9 @@ mod tests {
     }
 
     #[test]
-    fn shows_login_when_api_key_but_prefers_chatgpt() {
+    fn hides_login_when_authenticated_api_key() {
         let cfg = make_config(AuthMode::ChatGPT);
-        assert!(should_show_login_screen(
+        assert!(!should_show_login_screen(
             LoginStatus::AuthMode(AuthMode::ApiKey),
             &cfg
         ))

@@ -430,6 +430,16 @@ impl BottomPane<'_> {
         self.request_redraw();
     }
 
+    pub(crate) fn set_compression_hint(&mut self, show: bool) {
+        self.composer.set_show_compression_hint(show);
+        self.request_redraw();
+    }
+
+    pub(crate) fn set_compression_state(&mut self, enabled: bool) {
+        self.composer.set_compression_state(enabled);
+        self.request_redraw();
+    }
+
     // --- History helpers ---
 
     pub(crate) fn set_history_metadata(&mut self, log_id: u64, entry_count: usize) {
@@ -462,7 +472,7 @@ impl BottomPane<'_> {
     
     /// Set the live ring rows and maximum rows to display
     #[cfg(test)]
-    pub(crate) fn set_live_ring_rows(&mut self, max_rows: usize, rows: Vec<Line<'static>>) {
+    pub(crate) fn set_live_ring_rows(&mut self, max_rows: usize, rows: Vec<ratatui::text::Line<'static>>) {
         self.live_ring = Some(live_ring_widget::LiveRingWidget::new(max_rows, rows));
     }
 
@@ -547,6 +557,7 @@ impl WidgetRef for &BottomPane<'_> {
 mod tests {
     use super::*;
     use crate::app_event::AppEvent;
+    use ratatui::text::Line;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use std::sync::mpsc::channel;
@@ -714,6 +725,7 @@ mod tests {
             app_event_tx: tx.clone(),
             has_input_focus: true,
             enhanced_keys_supported: false,
+            using_chatgpt_auth: false,
         });
 
         // Start a running task so the status indicator replaces the composer.

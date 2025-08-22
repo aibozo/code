@@ -43,6 +43,10 @@ async fn spawn_command_under_sandbox(
 
 #[tokio::test]
 async fn python_multiprocessing_lock_works_under_sandbox() {
+    if !can_spawn_sandbox().await {
+        eprintln!("Skipping python_multiprocessing_lock_works_under_sandbox: exec denied in sandbox");
+        return;
+    }
     #[cfg(target_os = "macos")]
     let writable_roots = Vec::<PathBuf>::new();
 
@@ -167,6 +171,10 @@ fn unix_sock_body() {
 
 #[tokio::test]
 async fn allow_unix_socketpair_recvfrom() {
+    if !can_spawn_sandbox().await {
+        eprintln!("Skipping allow_unix_socketpair_recvfrom: exec denied in sandbox");
+        return;
+    }
     run_code_under_sandbox(
         "allow_unix_socketpair_recvfrom",
         &SandboxPolicy::ReadOnly,
@@ -215,5 +223,25 @@ where
         // Child branch: run the provided body.
         child_body().await;
         Ok(None)
+    }
+}
+
+#[allow(clippy::print_stdout)]
+async fn can_spawn_sandbox() -> bool {
+    // Try a minimal command under the sandbox; if spawning fails, assume exec
+    // is denied in this environment and skip the test.
+    let policy = SandboxPolicy::ReadOnly;
+    let cmd = vec!["bash".to_string(), "-lc".to_string(), "true".to_string()];
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let env = HashMap::new();
+    match spawn_command_under_sandbox(cmd, &policy, cwd, StdioPolicy::Inherit, env).await {
+        Ok(mut child) => {
+            let _ = child.wait().await;
+            true
+        }
+        Err(e) => {
+            println!("Skipping: unable to spawn sandboxed command: {e}");
+            false
+        }
     }
 }

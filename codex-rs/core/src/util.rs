@@ -42,3 +42,57 @@ pub fn is_inside_git_repo(base_dir: &Path) -> bool {
 
     false
 }
+
+/// Compute a stable repository key for the current workspace.
+///
+/// If `cwd` is inside a Git repository, this returns the absolute path of the
+/// repository root (the directory that contains the `.git` entry). Otherwise it
+/// returns the canonicalized `cwd`.
+pub fn repo_key(cwd: &Path) -> String {
+    // Walk up until we find a `.git` entry.
+    let mut dir = cwd.to_path_buf();
+    loop {
+        let git = dir.join(".git");
+        if git.exists() {
+            return dir
+                .canonicalize()
+                .unwrap_or(dir)
+                .to_string_lossy()
+                .to_string();
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    cwd.canonicalize()
+        .unwrap_or_else(|_| cwd.to_path_buf())
+        .to_string_lossy()
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::repo_key;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn repo_key_prefers_git_root_dir() {
+        let t = TempDir::new().unwrap();
+        let root = t.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join(".git")).unwrap();
+        let sub = root.join("a/b");
+        fs::create_dir_all(&sub).unwrap();
+        let key = repo_key(&sub);
+        assert_eq!(key, root.canonicalize().unwrap().to_string_lossy());
+    }
+
+    #[test]
+    fn repo_key_falls_back_to_cwd() {
+        let t = TempDir::new().unwrap();
+        let p = t.path();
+        let key = repo_key(p);
+        assert_eq!(key, p.canonicalize().unwrap().to_string_lossy());
+    }
+}

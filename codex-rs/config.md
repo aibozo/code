@@ -12,6 +12,21 @@ Codex supports several mechanisms for setting config values:
 
 Both the `--config` flag and the `config.toml` file support the following options:
 
+## Semantic Compression (Memory)
+
+Codex supports an optional, phased “semantic compression” feature (conversation summaries, embeddings, and a code index). It is disabled by default. See the semantic compression docs for architecture and configuration:
+
+- Overview and roadmap: `docs/semantic-compression/README.md`
+- Config shape and defaults: `docs/semantic-compression/20-config.md`
+
+When enabling embeddings (`memory.embedding.enabled = true`), Codex uses your OpenAI API key only for embeddings while keeping ChatGPT OAuth for normal usage. If no key is present, Codex shows a friendly notice and runs without embeddings. To add a key without setting environment variables:
+
+```sh
+code memory login              # prompts securely and saves to ~/.codex/auth.json
+# or
+code login --api-key sk-...    # equivalent, non-interactive
+```
+
 ## model
 
 The model that Codex should use.

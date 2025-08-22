@@ -74,12 +74,20 @@ async fn run_cmd(cmd: &[&str], writable_roots: &[PathBuf], timeout_ms: u64) {
 
 #[tokio::test]
 async fn test_root_read() {
+    if !can_run_linux_sandbox().await {
+        eprintln!("Skipping test_root_read: exec denied in sandbox");
+        return;
+    }
     run_cmd(&["ls", "-l", "/bin"], &[], SHORT_TIMEOUT_MS).await;
 }
 
 #[tokio::test]
 #[should_panic]
 async fn test_root_write() {
+    if !can_run_linux_sandbox().await {
+        eprintln!("Skipping test_root_write: exec denied in sandbox");
+        return;
+    }
     let tmpfile = NamedTempFile::new().unwrap();
     let tmpfile_path = tmpfile.path().to_string_lossy();
     run_cmd(
@@ -92,6 +100,10 @@ async fn test_root_write() {
 
 #[tokio::test]
 async fn test_dev_null_write() {
+    if !can_run_linux_sandbox().await {
+        eprintln!("Skipping test_dev_null_write: exec denied in sandbox");
+        return;
+    }
     run_cmd(
         &["bash", "-lc", "echo blah > /dev/null"],
         &[],
@@ -104,6 +116,10 @@ async fn test_dev_null_write() {
 
 #[tokio::test]
 async fn test_writable_root() {
+    if !can_run_linux_sandbox().await {
+        eprintln!("Skipping test_writable_root: exec denied in sandbox");
+        return;
+    }
     let tmpdir = tempfile::tempdir().unwrap();
     let file_path = tmpdir.path().join("test");
     run_cmd(
@@ -123,6 +139,10 @@ async fn test_writable_root() {
 #[tokio::test]
 #[should_panic(expected = "Sandbox(Timeout)")]
 async fn test_timeout() {
+    if !can_run_linux_sandbox().await {
+        eprintln!("Skipping test_timeout: exec denied in sandbox");
+        return;
+    }
     run_cmd(&["sleep", "2"], &[], 50).await;
 }
 
@@ -181,28 +201,48 @@ async fn assert_network_blocked(cmd: &[&str]) {
 
 #[tokio::test]
 async fn sandbox_blocks_curl() {
+    if !can_run_linux_sandbox().await {
+        eprintln!("Skipping sandbox_blocks_curl: exec denied in sandbox");
+        return;
+    }
     assert_network_blocked(&["curl", "-I", "http://openai.com"]).await;
 }
 
 #[tokio::test]
 async fn sandbox_blocks_wget() {
+    if !can_run_linux_sandbox().await {
+        eprintln!("Skipping sandbox_blocks_wget: exec denied in sandbox");
+        return;
+    }
     assert_network_blocked(&["wget", "-qO-", "http://openai.com"]).await;
 }
 
 #[tokio::test]
 async fn sandbox_blocks_ping() {
+    if !can_run_linux_sandbox().await {
+        eprintln!("Skipping sandbox_blocks_ping: exec denied in sandbox");
+        return;
+    }
     // ICMP requires raw socket – should be denied quickly with EPERM.
     assert_network_blocked(&["ping", "-c", "1", "8.8.8.8"]).await;
 }
 
 #[tokio::test]
 async fn sandbox_blocks_nc() {
+    if !can_run_linux_sandbox().await {
+        eprintln!("Skipping sandbox_blocks_nc: exec denied in sandbox");
+        return;
+    }
     // Zero‑length connection attempt to localhost.
     assert_network_blocked(&["nc", "-z", "127.0.0.1", "80"]).await;
 }
 
 #[tokio::test]
 async fn sandbox_blocks_ssh() {
+    if !can_run_linux_sandbox().await {
+        eprintln!("Skipping sandbox_blocks_ssh: exec denied in sandbox");
+        return;
+    }
     // Force ssh to attempt a real TCP connection but fail quickly.  `BatchMode`
     // avoids password prompts, and `ConnectTimeout` keeps the hang time low.
     assert_network_blocked(&[
@@ -218,13 +258,49 @@ async fn sandbox_blocks_ssh() {
 
 #[tokio::test]
 async fn sandbox_blocks_getent() {
+    if !can_run_linux_sandbox().await {
+        eprintln!("Skipping sandbox_blocks_getent: exec denied in sandbox");
+        return;
+    }
     assert_network_blocked(&["getent", "ahosts", "openai.com"]).await;
 }
 
 #[tokio::test]
 async fn sandbox_blocks_dev_tcp_redirection() {
+    if !can_run_linux_sandbox().await {
+        eprintln!("Skipping sandbox_blocks_dev_tcp_redirection: exec denied in sandbox");
+        return;
+    }
     // This syntax is only supported by bash and zsh. We try bash first.
     // Fallback generic socket attempt using /bin/sh with bash‑style /dev/tcp.  Not
     // all images ship bash, so we guard against 127 as well.
     assert_network_blocked(&["bash", "-c", "echo hi > /dev/tcp/127.0.0.1/80"]).await;
+}
+
+// Quick capability probe: try a no‑op command under the linux sandbox. If spawning
+// fails (common in CI sandboxes with heavy seccomp), we skip the tests gracefully.
+async fn can_run_linux_sandbox() -> bool {
+    let params = ExecParams {
+        command: vec!["bash".into(), "-lc".into(), "true".into()],
+        cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        timeout_ms: Some(200),
+        env: create_env_from_core_vars(),
+        with_escalated_permissions: None,
+        justification: None,
+    };
+    let sandbox_policy = SandboxPolicy::new_read_only_policy();
+    let sandbox_program = env!("CARGO_BIN_EXE_codex-linux-sandbox");
+    let codex_linux_sandbox_exe: Option<PathBuf> = Some(PathBuf::from(sandbox_program));
+    match process_exec_tool_call(
+        params,
+        SandboxType::LinuxSeccomp,
+        &sandbox_policy,
+        &codex_linux_sandbox_exe,
+        None,
+    )
+    .await
+    {
+        Ok(out) => out.exit_code == 0,
+        Err(_) => false,
+    }
 }

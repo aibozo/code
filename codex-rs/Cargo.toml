@@ -20,6 +20,7 @@ members = [
     "protocol",
     "protocol-ts",
     "tui",
+    "memory",
 ]
 resolver = "2"
 

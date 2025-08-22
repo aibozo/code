@@ -2,6 +2,8 @@
 #![expect(clippy::expect_used)]
 
 use ratatui::backend::TestBackend;
+use ratatui::Terminal;
+use ratatui::TerminalOptions;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::style::Style;
@@ -27,13 +29,13 @@ macro_rules! assert_contains {
 struct TestScenario {
     width: u16,
     height: u16,
-    term: codex_tui::custom_terminal::Terminal<TestBackend>,
+    term: Terminal<TestBackend>,
 }
 
 impl TestScenario {
     fn new(width: u16, height: u16, viewport: Rect) -> Self {
         let backend = TestBackend::new(width, height);
-        let mut term = codex_tui::custom_terminal::Terminal::with_options(backend)
+        let mut term = Terminal::with_options(backend, TerminalOptions::default())
             .expect("failed to construct terminal");
         term.set_viewport_area(viewport);
         Self {

@@ -1,4 +1,5 @@
 use codex_core::WireApi;
+use codex_core::memory::openai_embeddings::has_openai_api_key;
 use codex_core::config::Config;
 
 use crate::sandbox_summary::summarize_sandbox_policy;
@@ -23,6 +24,26 @@ pub fn create_config_summary_entries(config: &Config) -> Vec<(&'static str, Stri
             "reasoning summaries",
             config.model_reasoning_summary.to_string(),
         ));
+    }
+
+    // Semantic compression (memory) summary line
+    let mem = &config.memory;
+    if mem.enabled {
+        let embed = if mem.embedding.enabled {
+            if has_openai_api_key(&config.codex_home) { "on" } else { "missing-key" }
+        } else {
+            "off"
+        };
+        let code_idx = if mem.code_index.enabled { "on" } else { "off" };
+        entries.push((
+            "memory",
+            format!(
+                "enabled (inject={}/{} chars, embed={}, code-index={})",
+                mem.inject.max_items, mem.inject.max_chars, embed, code_idx
+            ),
+        ));
+    } else {
+        entries.push(("memory", "disabled".to_string()));
     }
 
     entries

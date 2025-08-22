@@ -76,6 +76,11 @@ async fn mock_get_task_with_fixture() -> anyhow::Result<GetTaskResponse> {
 
 #[tokio::test]
 async fn test_apply_command_creates_fibonacci_file() {
+    // Skip if we cannot execute local processes (e.g., restricted CI sandbox).
+    if tokio::process::Command::new("git").arg("--version").output().await.is_err() {
+        eprintln!("Skipping test_apply_command_creates_fibonacci_file: exec denied in sandbox");
+        return;
+    }
     let temp_repo = create_temp_git_repo()
         .await
         .expect("Failed to create temp git repo");
@@ -118,6 +123,10 @@ async fn test_apply_command_creates_fibonacci_file() {
 
 #[tokio::test]
 async fn test_apply_command_with_merge_conflicts() {
+    if tokio::process::Command::new("git").arg("--version").output().await.is_err() {
+        eprintln!("Skipping test_apply_command_with_merge_conflicts: exec denied in sandbox");
+        return;
+    }
     let temp_repo = create_temp_git_repo()
         .await
         .expect("Failed to create temp git repo");

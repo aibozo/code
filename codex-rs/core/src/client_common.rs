@@ -212,63 +212,74 @@ impl From<TextVerbosityConfig> for OpenAiTextVerbosity {
 /// Keeps the first screenshot and the last 4 screenshots.
 /// Replaces removed screenshots with a placeholder message.
 fn limit_screenshots_in_input(input: &mut Vec<ResponseItem>) {
-    // Find all screenshot positions
-    let mut screenshot_positions = Vec::new();
-    
+    // Find all positions of EPHEMERAL screenshots (i.e., images immediately
+    // following a marker text that starts with "[EPHEMERAL:")
+    let mut ephemeral_image_positions: Vec<usize> = Vec::new();
+
     for (idx, item) in input.iter().enumerate() {
         if let ResponseItem::Message { content, .. } = item {
-            let has_screenshot = content
-                .iter()
-                .any(|c| matches!(c, ContentItem::InputImage { .. }));
-            if has_screenshot {
-                screenshot_positions.push(idx);
+            let mut saw_ephemeral_marker = false;
+            for c in content {
+                match c {
+                    ContentItem::InputText { text } if text.starts_with("[EPHEMERAL:") => {
+                        saw_ephemeral_marker = true;
+                    }
+                    ContentItem::InputImage { .. } if saw_ephemeral_marker => {
+                        // Count only the first image after an ephemeral marker
+                        ephemeral_image_positions.push(idx);
+                        saw_ephemeral_marker = false; // only the next image is considered ephemeral
+                    }
+                    _ => {}
+                }
             }
         }
     }
-    
-    // If we have 5 or fewer screenshots, no action needed
-    if screenshot_positions.len() <= 5 {
+
+    // If we have 5 or fewer ephemeral screenshots, no action needed
+    if ephemeral_image_positions.len() <= 5 {
         return;
     }
-    
-    // Determine which screenshots to keep
+
+    // Determine which EPHEMERAL screenshots to keep: first + last 4
     let mut positions_to_keep = std::collections::HashSet::new();
-    
-    // Keep the first screenshot
-    if let Some(&first) = screenshot_positions.first() {
+    if let Some(&first) = ephemeral_image_positions.first() {
         positions_to_keep.insert(first);
     }
-    
-    // Keep the last 4 screenshots
-    let last_four_start = screenshot_positions.len().saturating_sub(4);
-    for &pos in &screenshot_positions[last_four_start..] {
+    let last_four_start = ephemeral_image_positions.len().saturating_sub(4);
+    for &pos in &ephemeral_image_positions[last_four_start..] {
         positions_to_keep.insert(pos);
     }
-    
-    // Replace screenshots that should be removed
-    for &pos in &screenshot_positions {
-        if !positions_to_keep.contains(&pos) {
-            if let Some(ResponseItem::Message { content, .. }) = input.get_mut(pos) {
-                // Replace image content with placeholder message
-                let mut new_content = Vec::new();
-                for item in content.iter() {
-                    match item {
-                        ContentItem::InputImage { .. } => {
-                            new_content.push(ContentItem::InputText {
-                                text: "[screenshot no longer available]".to_string(),
-                            });
+
+    // Replace EPHEMERAL screenshots that should be removed with a placeholder,
+    // without affecting user‑provided images.
+    for (idx, item) in input.iter_mut().enumerate() {
+        if !positions_to_keep.contains(&idx) {
+            if let ResponseItem::Message { content, .. } = item {
+                // Edit in place: only replace the first image that follows an
+                // ephemeral marker inside this message.
+                let mut saw_ephemeral_marker = false;
+                for ct in content.iter_mut() {
+                    match ct {
+                        ContentItem::InputText { text } if text.starts_with("[EPHEMERAL:") => {
+                            saw_ephemeral_marker = true;
                         }
-                        other => new_content.push(other.clone()),
+                        ContentItem::InputImage { .. } if saw_ephemeral_marker => {
+                            *ct = ContentItem::InputText {
+                                text: "[screenshot no longer available]".to_string(),
+                            };
+                            saw_ephemeral_marker = false; // only the first image is replaced
+                            break; // done for this message
+                        }
+                        _ => {}
                     }
                 }
-                *content = new_content;
             }
         }
     }
-    
+
     tracing::debug!(
-        "Limited screenshots from {} to {} (kept first and last 4)",
-        screenshot_positions.len(),
+        "Limited EPHEMERAL screenshots from {} to {} (kept first and last 4)",
+        ephemeral_image_positions.len(),
         positions_to_keep.len()
     );
 }

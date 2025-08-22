@@ -38,6 +38,9 @@ mod file_search;
 mod get_git_diff;
 mod glitch_animation;
 mod history_cell;
+#[cfg(feature = "vt100-tests")]
+pub mod insert_history;
+#[cfg(not(feature = "vt100-tests"))]
 mod insert_history;
 pub mod live_wrap;
 mod markdown;

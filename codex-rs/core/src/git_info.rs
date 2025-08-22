@@ -588,10 +588,11 @@ mod tests {
             .await
             .expect("Should collect git info from repo");
 
-        // Should have repository URL
-        assert_eq!(
-            git_info.repository_url,
-            Some("https://github.com/example/repo.git".to_string())
+        // Should have repository URL; allow either HTTPS or SSH forms depending on git config
+        let url = git_info.repository_url.expect("repository_url should be set");
+        assert!(
+            url.contains("github.com/example/repo.git"),
+            "unexpected remote url: {url}"
         );
     }
 

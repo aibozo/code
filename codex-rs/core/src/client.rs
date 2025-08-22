@@ -97,9 +97,34 @@ impl ModelClient {
         }
     }
 
+    /// Expose the configured Codex home directory path.
+    pub fn get_codex_home(&self) -> &std::path::Path {
+        &self.config.codex_home
+    }
+
+    /// Expose the semantic compression (memory) configuration.
+    pub fn get_memory_config(&self) -> &crate::config_types::MemoryConfig {
+        &self.config.memory
+    }
+
+    /// Return the current session UUID.
+    pub fn get_session_id(&self) -> &Uuid {
+        &self.session_id
+    }
+
     /// Get the reasoning effort configuration
     pub fn get_reasoning_effort(&self) -> ReasoningEffortConfig {
         self.effort
+    }
+
+    /// Get the model's context window in tokens, if known.
+    pub fn get_model_context_window(&self) -> Option<u64> {
+        self.config.model_context_window
+    }
+
+    /// Get the model's max output tokens, if configured.
+    pub fn get_model_max_output_tokens(&self) -> Option<u64> {
+        self.config.model_max_output_tokens
     }
 
     /// Get the text verbosity configuration

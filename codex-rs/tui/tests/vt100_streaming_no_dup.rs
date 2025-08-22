@@ -1,12 +1,14 @@
 #![cfg(feature = "vt100-tests")]
 
 use ratatui::backend::TestBackend;
+use ratatui::Terminal;
+use ratatui::TerminalOptions;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 
-fn term(viewport: Rect) -> codex_tui::custom_terminal::Terminal<TestBackend> {
+fn term(viewport: Rect) -> Terminal<TestBackend> {
     let backend = TestBackend::new(20, 6);
-    let mut term = codex_tui::custom_terminal::Terminal::with_options(backend)
+    let mut term = Terminal::with_options(backend, TerminalOptions::default())
         .unwrap_or_else(|e| panic!("failed to construct terminal: {e}"));
     term.set_viewport_area(viewport);
     term

@@ -1317,6 +1317,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "vt100-tests"))]
     fn fuzz_textarea_randomized() {
         // Deterministic seed for reproducibility
         // Seed the RNG based on the current day in Pacific Time (PST/PDT). This
@@ -1468,7 +1469,6 @@ mod tests {
                                     }
                                     ta.replace_range(s..e, &srep);
                                 }
-                                ta.replace_range(s..e, &srep);
                             }
                         }
                     }

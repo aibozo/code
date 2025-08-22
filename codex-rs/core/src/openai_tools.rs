@@ -622,8 +622,9 @@ mod tests {
 
         assert_eq_tool_names(&tools, &["shell", "browser_open", "browser_status", "agent_run", "agent_check", "agent_result", "agent_cancel", "agent_wait", "agent_list", "test_server/do_something_cool"]);
 
+        let last = tools.last().expect("should include mcp tool");
         assert_eq!(
-            tools[1],
+            *last,
             OpenAiTool::Function(ResponsesApiTool {
                 name: "test_server/do_something_cool".to_string(),
                 parameters: JsonSchema::Object {
@@ -702,8 +703,9 @@ mod tests {
 
         assert_eq_tool_names(&tools, &["shell", "browser_open", "browser_status", "agent_run", "agent_check", "agent_result", "agent_cancel", "agent_wait", "agent_list", "dash/search"]);
 
+        let last = tools.last().expect("should include mcp tool");
         assert_eq!(
-            tools[1],
+            *last,
             OpenAiTool::Function(ResponsesApiTool {
                 name: "dash/search".to_string(),
                 parameters: JsonSchema::Object {
@@ -755,8 +757,9 @@ mod tests {
         );
 
         assert_eq_tool_names(&tools, &["shell", "browser_open", "browser_status", "agent_run", "agent_check", "agent_result", "agent_cancel", "agent_wait", "agent_list", "dash/paginate"]);
+        let last = tools.last().expect("should include mcp tool");
         assert_eq!(
-            tools[1],
+            *last,
             OpenAiTool::Function(ResponsesApiTool {
                 name: "dash/paginate".to_string(),
                 parameters: JsonSchema::Object {
@@ -806,8 +809,9 @@ mod tests {
         );
 
         assert_eq_tool_names(&tools, &["shell", "browser_open", "browser_status", "agent_run", "agent_check", "agent_result", "agent_cancel", "agent_wait", "agent_list", "dash/tags"]);
+        let last = tools.last().expect("should include mcp tool");
         assert_eq!(
-            tools[1],
+            *last,
             OpenAiTool::Function(ResponsesApiTool {
                 name: "dash/tags".to_string(),
                 parameters: JsonSchema::Object {
@@ -860,8 +864,9 @@ mod tests {
         );
 
         assert_eq_tool_names(&tools, &["shell", "browser_open", "browser_status", "agent_run", "agent_check", "agent_result", "agent_cancel", "agent_wait", "agent_list", "dash/value"]);
+        let last = tools.last().expect("should include mcp tool");
         assert_eq!(
-            tools[1],
+            *last,
             OpenAiTool::Function(ResponsesApiTool {
                 name: "dash/value".to_string(),
                 parameters: JsonSchema::Object {

@@ -427,3 +427,194 @@ impl From<codex_protocol::config_types::ReasoningSummary> for ReasoningSummary {
         }
     }
 }
+
+// ============================
+// Memory (semantic compression)
+// ============================
+
+/// Injection budgeting for semantic compression (summaries/notes inserted into prompts).
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct MemoryInjectConfig {
+    #[serde(default = "MemoryInjectConfig::default_max_items")]
+    pub max_items: usize,
+    #[serde(default = "MemoryInjectConfig::default_max_chars")]
+    pub max_chars: usize,
+}
+
+impl MemoryInjectConfig {
+    fn default_max_items() -> usize { 2 }
+    fn default_max_chars() -> usize { 500 }
+}
+
+impl Default for MemoryInjectConfig {
+    fn default() -> Self {
+        Self {
+            max_items: Self::default_max_items(),
+            max_chars: Self::default_max_chars(),
+        }
+    }
+}
+
+/// Embedding configuration for semantic search over summaries/code hints.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct MemoryEmbeddingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "MemoryEmbeddingConfig::default_provider")]
+    pub provider: String,
+    #[serde(default = "MemoryEmbeddingConfig::default_top_k")]
+    pub top_k: usize,
+    #[serde(default = "MemoryEmbeddingConfig::default_dim")]
+    pub dim: usize,
+}
+
+impl MemoryEmbeddingConfig {
+    fn default_provider() -> String { "openai".to_string() }
+    fn default_top_k() -> usize { 5 }
+    fn default_dim() -> usize { 3072 }
+}
+
+impl Default for MemoryEmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: Self::default_provider(),
+            top_k: Self::default_top_k(),
+            dim: Self::default_dim(),
+        }
+    }
+}
+
+/// Code index configuration (optional semantic codebase index).
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct MemoryCodeIndexConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "MemoryCodeIndexConfig::default_chunk_bytes")]
+    pub chunk_bytes: usize,
+    #[serde(default = "MemoryCodeIndexConfig::default_top_k")]
+    pub top_k: usize,
+}
+
+impl MemoryCodeIndexConfig {
+    fn default_chunk_bytes() -> usize { 1500 }
+    fn default_top_k() -> usize { 5 }
+}
+
+impl Default for MemoryCodeIndexConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            chunk_bytes: Self::default_chunk_bytes(),
+            top_k: Self::default_top_k(),
+        }
+    }
+}
+
+/// Top-level configuration for semantic compression features.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct MemoryConfig {
+    /// Master toggle for all memory features (disabled by default).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// When `true`, summarize the pruned portion of the conversation and persist.
+    #[serde(default = "MemoryConfig::default_summarize_on_prune")]
+    pub summarize_on_prune: bool,
+
+    /// Prompt injection budget.
+    #[serde(default)]
+    pub inject: MemoryInjectConfig,
+
+    /// Embedding-backed retrieval settings (Phase 2, optional).
+    #[serde(default)]
+    pub embedding: MemoryEmbeddingConfig,
+
+    /// Code index settings (Phase 3, optional).
+    #[serde(default)]
+    pub code_index: MemoryCodeIndexConfig,
+
+    /// Enable fuzzy de-duplication between code and memory retrieval sections.
+    /// When true, memory bullets that highly overlap with code bullets are removed.
+    /// Defaults to true.
+    #[serde(default = "MemoryConfig::default_fuzzy_dedupe_enabled")]
+    pub fuzzy_dedupe_enabled: bool,
+
+    /// Jaccard similarity threshold for title-based fuzzy de-duplication (0.0–1.0).
+    /// Applies only when titles are not exactly equal.
+    #[serde(default = "MemoryConfig::default_fuzzy_title_jaccard")]
+    pub fuzzy_dedupe_title_jaccard: f32,
+
+    /// Jaccard similarity threshold for content-based fuzzy de-duplication (0.0–1.0).
+    #[serde(default = "MemoryConfig::default_fuzzy_content_jaccard")]
+    pub fuzzy_dedupe_content_jaccard: f32,
+
+    /// Minimum prefix length for the strong containment heuristic. If one text contains the
+    /// other's first N characters (after trimming), the items are considered duplicates.
+    #[serde(default = "MemoryConfig::default_fuzzy_min_containment_prefix")]
+    pub fuzzy_dedupe_min_containment_prefix: usize,
+
+    /// Weight for the recency component when blending ranking scores (0.0–1.0).
+    /// Final score = (1 - alpha) * similarity + alpha * recency.
+    #[serde(default = "MemoryConfig::default_recency_blend_alpha")]
+    pub recency_blend_alpha: f32,
+
+    /// Half-life in days used by the recency decay: recency = exp(-ln(2) * age_days / half_life_days)
+    #[serde(default = "MemoryConfig::default_recency_half_life_days")]
+    pub recency_half_life_days: f32,
+
+    /// Number of recent conversation items to keep uncompressed in history.
+    /// Older items may be summarized and pruned.
+    #[serde(default = "MemoryConfig::default_keep_last_messages")]
+    pub keep_last_messages: usize,
+
+    /// Character budget for the compact summary stored when pruning.
+    /// This does not affect the prompt injection budget.
+    #[serde(default = "MemoryConfig::default_summary_max_chars")]
+    pub summary_max_chars: usize,
+
+    /// When true, use an LLM (via OpenAI API) to produce summaries when pruning.
+    /// Falls back to a local compact summarizer on failure.
+    #[serde(default = "MemoryConfig::default_use_llm_summarizer")]
+    pub use_llm_summarizer: bool,
+
+    /// Model to use for LLM summaries (OpenAI).
+    #[serde(default = "MemoryConfig::default_summarizer_model")]
+    pub summarizer_model: String,
+}
+
+impl MemoryConfig {
+    fn default_summarize_on_prune() -> bool { true }
+    fn default_fuzzy_dedupe_enabled() -> bool { true }
+    fn default_fuzzy_title_jaccard() -> f32 { 0.97 }
+    fn default_fuzzy_content_jaccard() -> f32 { 0.92 }
+    fn default_fuzzy_min_containment_prefix() -> usize { 32 }
+    fn default_recency_blend_alpha() -> f32 { 0.15 }
+    fn default_recency_half_life_days() -> f32 { 7.0 }
+    fn default_keep_last_messages() -> usize { 20 }
+    fn default_summary_max_chars() -> usize { 400 }
+    fn default_use_llm_summarizer() -> bool { true }
+    fn default_summarizer_model() -> String { "gpt-5-nano".to_string() }
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            summarize_on_prune: Self::default_summarize_on_prune(),
+            inject: MemoryInjectConfig::default(),
+            embedding: MemoryEmbeddingConfig::default(),
+            code_index: MemoryCodeIndexConfig::default(),
+            fuzzy_dedupe_enabled: Self::default_fuzzy_dedupe_enabled(),
+            fuzzy_dedupe_title_jaccard: Self::default_fuzzy_title_jaccard(),
+            fuzzy_dedupe_content_jaccard: Self::default_fuzzy_content_jaccard(),
+            fuzzy_dedupe_min_containment_prefix: Self::default_fuzzy_min_containment_prefix(),
+            recency_blend_alpha: Self::default_recency_blend_alpha(),
+            recency_half_life_days: Self::default_recency_half_life_days(),
+            keep_last_messages: Self::default_keep_last_messages(),
+            summary_max_chars: Self::default_summary_max_chars(),
+            use_llm_summarizer: Self::default_use_llm_summarizer(),
+            summarizer_model: Self::default_summarizer_model(),
+        }
+    }
+}

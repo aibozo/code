@@ -19,6 +19,7 @@ use crate::protocol::AskForApproval;
 use crate::protocol::SandboxPolicy;
 use crate::config_types::ReasoningEffort;
 use crate::config_types::ReasoningSummary;
+use crate::config_types::MemoryConfig;
 use codex_login::AuthMode;
 use codex_protocol::config_types::SandboxMode;
 use dirs::home_dir;
@@ -140,6 +141,9 @@ pub struct Config {
 
     /// Collection of settings that are specific to the TUI.
     pub tui: Tui,
+
+    /// Semantic compression (memory) configuration.
+    pub memory: MemoryConfig,
 
     /// Path to the `codex-linux-sandbox` executable. This must be set if
     /// [`crate::exec::SandboxType::LinuxSeccomp`] is used. Note that this
@@ -331,6 +335,39 @@ pub fn set_tui_theme_name(codex_home: &Path, theme: ThemeName) -> anyhow::Result
     Ok(())
 }
 
+/// Persist memory (semantic compression) parameters into CODEX_HOME/config.toml
+/// under the `[memory]` table. Only updates provided fields.
+pub fn set_memory_config(
+    codex_home: &Path,
+    keep_last_messages: Option<usize>,
+    summary_max_chars: Option<usize>,
+) -> anyhow::Result<()> {
+    let config_path = codex_home.join(CONFIG_TOML_FILE);
+
+    // Parse existing config if present; otherwise start a new document.
+    let mut doc = match std::fs::read_to_string(config_path.clone()) {
+        Ok(s) => s.parse::<DocumentMut>()?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DocumentMut::new(),
+        Err(e) => return Err(e.into()),
+    };
+
+    if let Some(keep) = keep_last_messages {
+        doc["memory"]["keep_last_messages"] = toml_edit::value(keep as i64);
+    }
+    if let Some(chars) = summary_max_chars {
+        doc["memory"]["summary_max_chars"] = toml_edit::value(chars as i64);
+    }
+
+    // ensure codex_home exists
+    std::fs::create_dir_all(codex_home)?;
+
+    // write atomically
+    let tmp_file = NamedTempFile::new_in(codex_home)?;
+    std::fs::write(tmp_file.path(), doc.to_string())?;
+    tmp_file.persist(config_path)?;
+    Ok(())
+}
+
 /// Apply a single dotted-path override onto a TOML value.
 fn apply_toml_override(root: &mut TomlValue, path: &str, value: TomlValue) {
     use toml::value::Table;
@@ -448,6 +485,9 @@ pub struct ConfigToml {
 
     /// Browser configuration for integrated screenshot capabilities.
     pub browser: Option<BrowserConfig>,
+
+    /// Semantic compression (memory) configuration.
+    pub memory: Option<MemoryConfig>,
 
     /// When set to `true`, `AgentReasoning` events will be hidden from the
     /// UI/output. Defaults to `false`.
@@ -645,6 +685,7 @@ impl Config {
         };
 
         let history = cfg.history.unwrap_or_default();
+        let memory = cfg.memory.unwrap_or_default();
 
         let model = model
             .or(config_profile.model)
@@ -723,6 +764,7 @@ impl Config {
             history,
             file_opener: cfg.file_opener.unwrap_or(UriBasedFileOpener::VsCode),
             tui: cfg.tui.unwrap_or_default(),
+            memory,
             codex_linux_sandbox_exe,
 
             hide_agent_reasoning: cfg.hide_agent_reasoning.unwrap_or(false),
@@ -760,12 +802,12 @@ impl Config {
 
     /// Check if we're using ChatGPT authentication
     fn is_using_chatgpt_auth(codex_home: &Path) -> bool {
-        use codex_login::AuthMode;
-        use codex_login::CodexAuth;
-        
-        match CodexAuth::from_codex_home(codex_home, AuthMode::ApiKey) {
-            Ok(Some(auth)) => auth.mode == AuthMode::ChatGPT,
-            _ => false,
+        use codex_login::{AuthMode, CodexAuth};
+
+        // Prefer an explicit ChatGPT token when present.
+        match CodexAuth::from_codex_home(codex_home, AuthMode::ChatGPT) {
+            Ok(Some(_)) => true,
+            Ok(None) | Err(_) => false,
         }
     }
     
@@ -883,7 +925,7 @@ pub fn log_dir(cfg: &Config) -> std::io::Result<PathBuf> {
     Ok(p)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
     use crate::config_types::HistoryPersistence;

@@ -66,3 +66,11 @@ pub use safety::get_platform_sandbox;
 pub mod protocol;
 // Optionally expose upstream protocol config enums for callers that need them.
 pub use codex_protocol::config_types as protocol_config_types;
+pub mod memory;
+// Re-export common model types for integration tests and consumers
+pub use models::ContentItem;
+pub use models::FunctionCallOutputPayload;
+pub use models::LocalShellAction;
+pub use models::LocalShellExecAction;
+pub use models::LocalShellStatus;
+pub use models::ResponseItem;

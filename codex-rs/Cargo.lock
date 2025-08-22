@@ -788,6 +788,7 @@ dependencies = [
  "codex-protocol",
  "codex-protocol-ts",
  "codex-tui",
+ "libc",
  "serde_json",
  "tokio",
  "tracing",
@@ -817,8 +818,10 @@ dependencies = [
  "chrono",
  "codex-apply-patch",
  "codex-browser",
+ "codex-file-search",
  "codex-login",
  "codex-mcp-client",
+ "codex-memory",
  "codex-protocol",
  "core_test_support",
  "dirs",
@@ -834,6 +837,7 @@ dependencies = [
  "maplit",
  "mcp-types",
  "mime_guess",
+ "once_cell",
  "openssl-sys",
  "os_info",
  "predicates",
@@ -1003,6 +1007,17 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "codex-memory"
+version = "0.0.0"
+dependencies = [
+ "fs2",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]

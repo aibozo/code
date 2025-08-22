@@ -21,6 +21,11 @@ While we are [working to close the gap between the TypeScript and Rust implement
 
 Codex supports a rich set of configuration options. Note that the Rust CLI uses `config.toml` instead of `config.json`. See [`config.md`](./config.md) for details.
 
+For an opt-in, phased design that adds summaries/embeddings/code index to improve recall, see the Semantic Compression docs:
+
+- `docs/semantic-compression/README.md` (overview)
+- `docs/semantic-compression/20-config.md` (config shape)
+
 ### Model Context Protocol Support
 
 Codex CLI functions as an MCP client that can connect to MCP servers on startup. See the [`mcp_servers`](./config.md#mcp_servers) section in the configuration documentation for details.

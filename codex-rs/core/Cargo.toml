@@ -19,6 +19,8 @@ chrono = { version = "0.4", features = ["serde"] }
 codex-apply-patch = { path = "../apply-patch" }
 codex-browser = { path = "../browser" }
 codex-login = { path = "../login" }
+codex-memory = { path = "../memory" }
+codex-file-search = { path = "../file-search" }
 codex-mcp-client = { path = "../mcp-client" }
 codex-protocol = { path = "../protocol" }
 dirs = "6"
@@ -28,6 +30,7 @@ futures = "0.3"
 image = "0.25"
 img_hash = "3.2"
 lazy_static = "1.5"
+once_cell = "1.19"
 libc = "0.2.174"
 mcp-types = { path = "../mcp-types" }
 mime_guess = "2.0"

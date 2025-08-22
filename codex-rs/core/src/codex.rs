@@ -32,6 +32,13 @@ use tracing::info;
 use tracing::trace;
 use tracing::warn;
 use uuid::Uuid;
+use codex_memory::store::jsonl::JsonlVectorStore;
+use codex_memory::store::EmbeddedRecord as EmbRec;
+use codex_memory::embedding::EmbeddingProvider;
+use codex_file_search as file_search;
+use crate::memory::openai_embeddings::{OpenAiEmbeddingClient, has_openai_api_key};
+use crate::memory::code_index::ensure_code_index;
+use crate::model_provider_info::built_in_model_providers;
 
 /// Initial submission ID for session configuration
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
@@ -212,9 +219,18 @@ reasoning: {:?}"#,
     // Only include items if something has changed or is new
     let mut content: Vec<ContentItem> = Vec::new();
 
+    // Always prepend an ephemeral marker before any per‑turn status content so it
+    // is not persisted into future turn inputs. When the status text changed,
+    // include the full status text as ephemeral content; otherwise, still emit a
+    // small ephemeral marker if we are attaching a screenshot so the image can
+    // be filtered from history on subsequent turns.
     if status_changed {
         content.push(ContentItem::InputText {
-            text: current_status,
+            text: format!("[EPHEMERAL:turn_status]\n{}", current_status),
+        });
+    } else if include_screenshot {
+        content.push(ContentItem::InputText {
+            text: "[EPHEMERAL:turn_status]".to_string(),
         });
     }
 
@@ -1806,6 +1822,89 @@ async fn run_agent(sess: Arc<Session>, sub_id: String, input: Vec<InputItem>) {
         }
     }
     sess.remove_agent(&sub_id);
+
+    // After a completed turn, optionally summarize-and-prune conversation history
+    // when semantic memory is enabled. This keeps history bounded and records
+    // a compact summary for future retrieval (Phase 1 uses a JSONL store).
+    {
+        let mem_cfg = sess.client.get_memory_config();
+        if mem_cfg.enabled && mem_cfg.summarize_on_prune {
+            // Keep a configurable number of recent messages to avoid surprising truncation
+            let keep_last_messages: usize = mem_cfg.keep_last_messages.max(1);
+
+            let repo_key = crate::util::repo_key(&sess.cwd);
+            let store = crate::memory::store_jsonl::JsonlMemoryStore::new(sess.client.get_codex_home());
+            // Prefer LLM-backed summarizer when configured and API key is available.
+            let summary_max = mem_cfg.summary_max_chars.max(50);
+            let mut summarizer_box: Box<dyn crate::memory::summarizer::Summarizer> = {
+                if mem_cfg.use_llm_summarizer && has_openai_api_key(sess.client.get_codex_home()) {
+                    if let Some(p) = built_in_model_providers().get("openai").cloned() {
+                        if let Ok(s) = crate::memory::summarizer::OpenAiNanoSummarizer::from_provider(
+                            &p,
+                            sess.client.get_codex_home(),
+                            &mem_cfg.summarizer_model,
+                            summary_max,
+                        ) {
+                            Box::new(s)
+                        } else {
+                            Box::new(crate::memory::summarizer::CompactSummarizer::new(summary_max))
+                        }
+                    } else {
+                        Box::new(crate::memory::summarizer::CompactSummarizer::new(summary_max))
+                    }
+                } else {
+                    Box::new(crate::memory::summarizer::CompactSummarizer::new(summary_max))
+                }
+            };
+            let pruner = crate::conversation_history::prune::ConversationHistoryPruner::new(
+                keep_last_messages,
+            );
+
+            let mut state = sess.state.lock().unwrap();
+            let maybe_summary = pruner.summarize_then_prune(
+                &mut state.history,
+                &*summarizer_box,
+                &store,
+                &repo_key,
+                sess.client.get_session_id(),
+            );
+
+            // If embeddings are enabled and an API key is configured, embed and persist the vector.
+            if mem_cfg.embedding.enabled && has_openai_api_key(sess.client.get_codex_home()) {
+                if let Some(summary) = maybe_summary {
+                    // Build OpenAI embeddings client from built-in provider (respects OPENAI_BASE_URL override)
+                    if let Some(p) = built_in_model_providers().get("openai").cloned() {
+                        if let Ok(emb) = OpenAiEmbeddingClient::from_provider(&p, sess.client.get_codex_home()) {
+                            let dim = mem_cfg.embedding.dim;
+                            let text = format!("{}\n{}", summary.title, summary.text);
+                            if let Ok(vecs) = emb.embed(&[text.clone()], dim) {
+                                if let Some(v) = vecs.into_iter().next() {
+                                    let now_ms: u64 = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map_err(|e| std::io::Error::other(format!("clock error: {e}")))
+                                        .unwrap_or_default()
+                                        .as_millis() as u64;
+                                    let rec = EmbRec {
+                                        repo_key: repo_key.clone(),
+                                        id: Uuid::new_v4().to_string(),
+                                        ts: now_ms,
+                                        kind: "summary".to_string(),
+                                        title: summary.title,
+                                        text: summary.text,
+                                        dim,
+                                        vec: v,
+                                    };
+                                    let vstore = JsonlVectorStore::new(sess.client.get_codex_home());
+                                    let _ = vstore.add(&rec);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let event = Event {
         id: sub_id,
         msg: EventMsg::TaskComplete(TaskCompleteEvent {
@@ -1831,12 +1930,28 @@ async fn run_turn(
     );
 
     let mut retries = 0;
+    let mut injection_notice_sent = false;
     loop {
         // Build status items (screenshots, system status) fresh for each attempt
         let status_items = build_turn_status_items(sess).await;
 
+        // Optionally inject semantic memory summaries or retrieval ahead of history
+        let mut injected_input: Vec<ResponseItem> = Vec::new();
+        if sess.client.get_memory_config().enabled {
+            // Compute a conservative per-turn budget for memory injection to avoid context overflows.
+            let char_budget = compute_injection_char_budget(sess, &input);
+            // Optionally build a hybrid retrieval message combining code index + memory summaries.
+            if let Some(mem) = build_hybrid_injection_items(sess, &input, char_budget) {
+                injected_input.push(mem);
+            }
+        }
+
         let prompt = Prompt {
-            input: input.clone(),
+            input: if injected_input.is_empty() {
+                input.clone()
+            } else {
+                [injected_input, input.clone()].concat()
+            },
             user_instructions: sess.user_instructions.clone(),
             store: !sess.disable_response_storage,
             tools: tools.clone(),
@@ -1850,13 +1965,51 @@ async fn run_turn(
             status_items, // Include status items with this request
         };
 
+        // If we injected memory/code hints, emit a lightweight background notice once
+        if !injection_notice_sent {
+            if let Some(ResponseItem::Message { content, .. }) = prompt.input.first() {
+                // Find the first InputText block (hybrid injection is a single text message)
+                if let Some(ContentItem::InputText { text }) = content.iter().find(|c| matches!(c, ContentItem::InputText { .. })) {
+                    let mut code_count = 0usize;
+                    let mut mem_count = 0usize;
+                    enum Sec { None, Code, Mem }
+                    let mut sec = Sec::None;
+                    for line in text.lines() {
+                        if line.starts_with("[memory:code ") {
+                            sec = Sec::Code;
+                            continue;
+                        }
+                        if line.starts_with("[memory:retrieval ") || line.starts_with("[memory:summary ") {
+                            sec = Sec::Mem;
+                            continue;
+                        }
+                        if line.starts_with("[memory:") {
+                            // Unknown memory header
+                            sec = Sec::None;
+                            continue;
+                        }
+                        if line.starts_with("- ") {
+                            match sec {
+                                Sec::Code => code_count += 1,
+                                Sec::Mem => mem_count += 1,
+                                Sec::None => {}
+                            }
+                        }
+                    }
+                    if code_count > 0 || mem_count > 0 {
+                        let msg = format!("Injected code hints: {code_count}; memory items: {mem_count}");
+                        sess.notify_background_event(&sub_id, msg).await;
+                        injection_notice_sent = true;
+                    }
+                }
+            }
+        }
+
         match try_run_turn(sess, turn_diff_tracker, &sub_id, &prompt).await {
             Ok(output) => {
-                // Record status items to conversation history after successful turn
-                // This ensures they persist for future requests in the right chronological order
-                if !prompt.status_items.is_empty() {
-                    sess.record_conversation_items(&prompt.status_items).await;
-                }
+                // Do not record per‑turn status items (screenshots/system status)
+                // to the conversation history. They are injected fresh each turn
+                // and marked ephemeral so they do not pollute persistent context.
                 return Ok(output);
             }
             Err(CodexErr::Interrupted) => return Err(CodexErr::Interrupted),
@@ -1894,6 +2047,904 @@ async fn run_turn(
                 }
             }
         }
+    }
+}
+
+/// Build a single user message with recent memory summaries constrained by budget.
+fn build_memory_injection_items(sess: &Session, char_budget_override: usize) -> Option<ResponseItem> {
+    use crate::models::{ContentItem, ResponseItem};
+
+    let mem_cfg = sess.client.get_memory_config();
+    let repo_key = crate::util::repo_key(&sess.cwd);
+    let store = crate::memory::store_jsonl::JsonlMemoryStore::new(sess.client.get_codex_home());
+
+    let limit = std::cmp::max(1, mem_cfg.inject.max_items);
+    let Ok(rows) = store.recent(&repo_key, limit) else { return None };
+    if rows.is_empty() { return None; }
+
+    let max_chars = std::cmp::min(mem_cfg.inject.max_chars, char_budget_override.max(0));
+    if max_chars == 0 { return None; }
+    if let Some(text) = budget_summaries_to_text(rows, &repo_key, mem_cfg.inject.max_items, max_chars) {
+        return Some(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText { text }],
+        });
+    }
+    None
+}
+
+/// Build a retrieval-based memory injection (embeddings KNN) if enabled and available.
+fn build_embedding_memory_injection_items(sess: &Session, turn_input: &Vec<ResponseItem>, char_budget_override: usize) -> Option<ResponseItem> {
+    use crate::models::{ContentItem, ResponseItem};
+
+    let mem_cfg = sess.client.get_memory_config();
+    if !mem_cfg.embedding.enabled { return None; }
+    if !has_openai_api_key(sess.client.get_codex_home()) { return None; }
+
+    // Extract the latest user text from the current turn input.
+    let mut query = String::new();
+    for item in turn_input.iter().rev() {
+        if let ResponseItem::Message { role, content, .. } = item {
+            if role == "user" {
+                for c in content {
+                    match c {
+                        ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                            if !query.is_empty() { query.push(' '); }
+                            query.push_str(text);
+                        }
+                        _ => {}
+                    }
+                }
+                if !query.trim().is_empty() { break; }
+            }
+        }
+    }
+    let query = query.trim();
+    if query.is_empty() { return None; }
+
+    // Build OpenAI embeddings client
+    let provider = match built_in_model_providers().get("openai").cloned() {
+        Some(p) => p,
+        None => return None,
+    };
+    let client = match OpenAiEmbeddingClient::from_provider(&provider, sess.client.get_codex_home()) {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+
+    let dim = mem_cfg.embedding.dim;
+    let repo_key = crate::util::repo_key(&sess.cwd);
+    let vstore = JsonlVectorStore::new(sess.client.get_codex_home());
+    let Ok(vecs) = client.embed(&[query.to_string()], dim) else { return None };
+    let Some(vec) = vecs.into_iter().next() else { return None };
+    let top_k = std::cmp::max(1, mem_cfg.embedding.top_k);
+    // Prefer only summary-kind hits here to avoid overlap with code section
+    let Ok(mut hits) = vstore.query_kind(&repo_key, "summary", &vec, top_k) else { return None };
+    // Blend recency priors into similarity for improved ranking
+    blend_hits_with_recency_with_params(&mut hits, mem_cfg.recency_blend_alpha, mem_cfg.recency_half_life_days);
+    if hits.is_empty() { return None; }
+
+    let max_chars = std::cmp::min(mem_cfg.inject.max_chars, char_budget_override.max(0));
+    if max_chars == 0 { return None; }
+    if let Some(text) = budget_hits_to_text(hits, &repo_key, mem_cfg.inject.max_items, max_chars) {
+        return Some(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText { text }],
+        });
+    }
+    None
+}
+
+/// Render retrieved memory hits into a single user message within budgets.
+fn budget_hits_to_text(
+    mut hits: Vec<codex_memory::store::SearchHit>,
+    repo_key: &str,
+    max_items: usize,
+    max_chars: usize,
+) -> Option<String> {
+    if hits.is_empty() || max_items == 0 || max_chars == 0 { return None; }
+    if hits.len() > max_items { hits.truncate(max_items); }
+
+    let header = format!("[memory:retrieval v1 | repo={repo_key}]");
+    if header.len() + 1 > max_chars { return None; }
+    let mut remaining = max_chars - (header.len() + 1);
+    let mut text = String::new();
+    text.push_str(&header);
+    text.push('\n');
+    let mut bullets_written = 0usize;
+
+    for h in hits.into_iter() {
+        let bullet_full = format!("- {}: {}", h.title, h.text);
+        let need = bullet_full.len() + 1;
+        if need <= remaining {
+            text.push_str(&bullet_full);
+            text.push('\n');
+            remaining -= need;
+            bullets_written += 1;
+        } else if remaining > 4 {
+            let take = remaining - 4;
+            let truncated: String = bullet_full.chars().take(take).collect();
+            text.push_str(&truncated);
+            text.push_str(" ...\n");
+            remaining = 0;
+            bullets_written += 1;
+            break;
+        } else {
+            break;
+        }
+    }
+    if bullets_written == 0 { None } else { Some(text) }
+}
+
+/// Adjust similarity scores with a mild recency prior and sort in‑place.
+fn blend_hits_with_recency(hits: &mut Vec<codex_memory::store::SearchHit>) {
+    blend_hits_with_recency_with_params(hits, 0.15, 7.0);
+}
+
+fn blend_hits_with_recency_with_params(
+    hits: &mut Vec<codex_memory::store::SearchHit>,
+    alpha: f32,
+    half_life_days: f32,
+) {
+    if hits.is_empty() { return; }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let half_life_days = if half_life_days <= 0.0 { 7.0 } else { half_life_days };
+    let alpha = alpha.clamp(0.0, 1.0);
+    for h in hits.iter_mut() {
+        let age_days = ((now_ms.saturating_sub(h.ts)) as f32) / (1000.0 * 60.0 * 60.0 * 24.0);
+        let recency = (-std::f32::consts::LN_2 * (age_days / half_life_days)).exp();
+        let s = h.score.clamp(0.0, 1.0);
+        let blended = (1.0 - alpha) * s + alpha * recency;
+        h.score = blended;
+    }
+    hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+}
+
+/// Build a single user message that merges code index retrieval and memory retrieval
+/// within the provided budget. Prefers allocating ~60% to code and ~40% to memory.
+fn build_hybrid_injection_items(sess: &Session, turn_input: &Vec<ResponseItem>, total_budget: usize) -> Option<ResponseItem> {
+    if total_budget == 0 { return None; }
+    let mem_cfg = sess.client.get_memory_config();
+    let repo_key = crate::util::repo_key(&sess.cwd);
+
+    // If code index is enabled and API key present, ensure index, then query code.
+    let mut code_text: Option<String> = None;
+    if mem_cfg.embedding.enabled && mem_cfg.code_index.enabled && has_openai_api_key(sess.client.get_codex_home()) {
+        // Kick off indexing (best effort, once per repo)
+        ensure_code_index(&repo_key, sess.client.get_codex_home(), &sess.cwd, mem_cfg.embedding.dim, mem_cfg.code_index.chunk_bytes);
+        if let Some(ct) = build_code_retrieval_text(sess, turn_input, ((total_budget as f64) * 0.6) as usize) {
+            code_text = Some(ct);
+        }
+    }
+
+    // Memory retrieval (embeddings) fallback to summaries
+    let mem_budget = total_budget.saturating_sub(code_text.as_ref().map(|s| s.len()).unwrap_or(0));
+    let mut mem_text: Option<String> = None;
+    if mem_budget > 0 {
+        if let Some(rt) = build_embedding_retrieval_text(sess, turn_input, mem_budget.min(mem_cfg.inject.max_chars)) {
+            mem_text = Some(rt);
+        } else if let Some(st) = build_summary_retrieval_text(sess, mem_budget.min(mem_cfg.inject.max_chars)) {
+            mem_text = Some(st);
+        }
+    }
+
+    if code_text.is_none() && mem_text.is_none() { return None; }
+    let mut lines = String::new();
+    if let Some(ct) = code_text.as_ref() { lines.push_str(ct); lines.push('\n'); }
+    if let Some(mut mt) = mem_text { 
+        if let Some(ctxt) = code_text.as_ref() {
+            if mem_cfg.fuzzy_dedupe_enabled {
+                mt = dedupe_memory_against_code_with_thresholds(
+                    ctxt,
+                    &mt,
+                    mem_cfg.fuzzy_dedupe_title_jaccard,
+                    mem_cfg.fuzzy_dedupe_content_jaccard,
+                    mem_cfg.fuzzy_dedupe_min_containment_prefix,
+                );
+            }
+        }
+        lines.push_str(&mt);
+    }
+
+    Some(ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText { text: lines }],
+    })
+}
+
+fn dedupe_memory_against_code(code_text: &str, memory_text: &str) -> String {
+    dedupe_memory_against_code_with_thresholds(
+        code_text,
+        memory_text,
+        0.97,
+        0.92,
+        32,
+    )
+}
+
+fn dedupe_memory_against_code_with_thresholds(
+    code_text: &str,
+    memory_text: &str,
+    title_jaccard_threshold: f32,
+    content_jaccard_threshold: f32,
+    min_containment_prefix: usize,
+) -> String {
+    // Extract bullet texts from code section
+    let mut code_snippets: Vec<(String, String)> = Vec::new(); // (title, text)
+    for line in code_text.lines() {
+        if let Some(rest) = line.strip_prefix("- ") {
+            if let Some((title, txt)) = rest.split_once(':') {
+                code_snippets.push((title.trim().to_string(), txt.trim().to_string()));
+            }
+        }
+    }
+    if code_snippets.is_empty() { return memory_text.to_string(); }
+
+    // Rebuild memory text filtering bullets that strongly overlap with code text
+    let mut out = String::new();
+    let mut wrote_header = false;
+    for (idx, line) in memory_text.lines().enumerate() {
+        if idx == 0 {
+            // header line
+            out.push_str(line);
+            out.push('\n');
+            wrote_header = true;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("- ") {
+            if let Some((mtitle, mtxt)) = rest.split_once(':') {
+                let mtitle = mtitle.trim();
+                let mtxt = mtxt.trim();
+
+                let is_dup = code_snippets.iter().any(|(ctitle, ctxt)| {
+                    let title_sim = jaccard_similarity_tokens(mtitle, ctitle) >= title_jaccard_threshold;
+                    let content_sim = jaccard_similarity_tokens(mtxt, ctxt) >= content_jaccard_threshold;
+                    let strong_containment = {
+                        let (a, b): (&str, &str) = if mtxt.len() >= ctxt.len() { (mtxt, ctxt.as_str()) } else { (ctxt, mtxt) };
+                        let mut min_take = min_containment_prefix;
+                        min_take = min_take.min(a.len()).min(b.len());
+                        if min_take == 0 { false } else { a.contains(&b[..min_take]) }
+                    };
+
+                    // Require both high title similarity and high content similarity (or strong containment)
+                    (title_sim && (content_sim || strong_containment)) || strong_containment
+                });
+                if is_dup { continue; }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if wrote_header { out.trim_end().to_string() } else { memory_text.to_string() }
+}
+
+fn jaccard_similarity_tokens(a: &str, b: &str) -> f32 {
+    use std::collections::HashSet;
+    fn tokens(s: &str) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for w in s.split(|c: char| !c.is_alphanumeric()) {
+            let t = w.trim().to_ascii_lowercase();
+            if !t.is_empty() { out.insert(t); }
+        }
+        out
+    }
+    let ta = tokens(a);
+    let tb = tokens(b);
+    if ta.is_empty() && tb.is_empty() { return 1.0; }
+    if ta.is_empty() || tb.is_empty() { return 0.0; }
+    let inter = ta.intersection(&tb).count() as f32;
+    let union = (ta.len() + tb.len()) as f32 - inter;
+    if union <= 0.0 { 0.0 } else { inter / union }
+}
+
+fn build_code_retrieval_text(sess: &Session, turn_input: &Vec<ResponseItem>, char_budget: usize) -> Option<String> {
+    if char_budget == 0 { return None; }
+    let mem_cfg = sess.client.get_memory_config();
+    if !mem_cfg.code_index.enabled { return None; }
+
+    // Prepare budget and header
+    let repo_key = crate::util::repo_key(&sess.cwd);
+    let header = format!("[memory:code v1 | repo={repo_key}]");
+    if header.len() + 1 > char_budget { return None; }
+    let mut remaining = char_budget - (header.len() + 1);
+
+    // Collect bullets from semantic code index (when embeddings available)
+    let mut bullets: Vec<String> = Vec::new();
+    let query = match extract_latest_user_text(turn_input) { Some(q) => q, None => String::new() };
+
+    // Semantic retrieval via code index vectors
+    if mem_cfg.embedding.enabled && has_openai_api_key(sess.client.get_codex_home()) {
+        if let Some(p) = built_in_model_providers().get("openai").cloned() {
+            if let Ok(client) = OpenAiEmbeddingClient::from_provider(&p, sess.client.get_codex_home()) {
+                let dim = mem_cfg.embedding.dim;
+                if let Ok(vecs) = client.embed(&[query.clone()], dim) {
+                    if let Some(vec) = vecs.into_iter().next() {
+                        let vstore = JsonlVectorStore::new(sess.client.get_codex_home());
+                        let top_k = std::cmp::max(1, mem_cfg.code_index.top_k);
+                        if let Ok(hits) = vstore.query_kind(&repo_key, "code", &vec, top_k) {
+                            for h in hits.into_iter() {
+                                bullets.push(format!("- {}: {}", h.title, h.text));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Lexical retrieval via fuzzy file search on workspace paths
+    // Split remaining budget roughly in half between semantic and lexical bullets if both exist.
+    let lexical_file_limit = std::cmp::max(1, mem_cfg.code_index.top_k);
+    let chunk_bytes = std::cmp::max(512, mem_cfg.code_index.chunk_bytes);
+    let lexical_bullets = gather_lexical_bullets(sess, &query, lexical_file_limit, chunk_bytes);
+    // Interleave: prefer semantic first, then lexical, but keep both.
+    if bullets.is_empty() {
+        bullets.extend(lexical_bullets);
+    } else {
+        // Interleave by alternating semantic and lexical to increase variety.
+        let mut merged: Vec<String> = Vec::new();
+        let mut i = 0usize;
+        let mut j = 0usize;
+        while i < bullets.len() || j < lexical_bullets.len() {
+            if i < bullets.len() { merged.push(bullets[i].clone()); i += 1; }
+            if j < lexical_bullets.len() { merged.push(lexical_bullets[j].clone()); j += 1; }
+        }
+        bullets = merged;
+    }
+
+    if bullets.is_empty() { return None; }
+
+    // Render into the budget
+    let mut out = String::new();
+    out.push_str(&header);
+    out.push('\n');
+    for b in bullets.into_iter() {
+        let need = b.len() + 1;
+        if need <= remaining {
+            out.push_str(&b);
+            out.push('\n');
+            remaining -= need;
+        } else if remaining > 4 {
+            let take = remaining - 4;
+            let truncated: String = b.chars().take(take).collect();
+            out.push_str(&truncated);
+            out.push_str(" ...\n");
+            remaining = 0;
+            break;
+        } else {
+            break;
+        }
+    }
+    if out.trim().is_empty() { None } else { Some(out) }
+}
+
+fn gather_lexical_bullets(sess: &Session, query: &str, file_limit: usize, chunk_bytes: usize) -> Vec<String> {
+    use std::num::NonZeroUsize;
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+    if query.trim().is_empty() { return Vec::new(); }
+
+    let limit = NonZeroUsize::new(file_limit.max(1)).unwrap();
+    let threads = NonZeroUsize::new(4).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let results = file_search::run(
+        query,
+        limit,
+        &sess.cwd,
+        Vec::new(),
+        threads,
+        cancel,
+        false,
+    );
+    let Ok(res) = results else { return Vec::new() };
+    let mut bullets: Vec<String> = Vec::new();
+    for fm in res.matches.into_iter().take(file_limit) {
+        let rel = fm.path;
+        let path = sess.cwd.join(&rel);
+        // Read a small chunk from the beginning; skip binary files
+        let snippet = match std::fs::File::open(&path) {
+            Ok(mut f) => {
+                use std::io::Read;
+                let mut buf = Vec::new();
+                // Cap read to chunk_bytes*2 to improve likelihood of a useful excerpt while still bounded
+                let cap = (chunk_bytes as u64).saturating_mul(2) as usize;
+                let _ = f.by_ref().take(cap as u64).read_to_end(&mut buf);
+                if buf.iter().any(|&b| b == 0) { continue; }
+                match String::from_utf8(buf) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // Best effort: take the valid prefix
+                        let valid = e.into_bytes();
+                        let upto = valid.len().min(cap);
+                        String::from_utf8_lossy(&valid[..upto]).to_string()
+                    }
+                }
+            }
+            Err(_) => continue,
+        };
+
+        let mut text = snippet;
+        // Trim to chunk_bytes chars and prefer ending at a newline when present.
+        if text.chars().count() > chunk_bytes {
+            let prefix: String = text.chars().take(chunk_bytes).collect();
+            if let Some(pos) = prefix.rfind('\n') {
+                // Safe: pos is a valid byte index into `prefix`
+                text = prefix[..=pos].to_string();
+            } else {
+                text = prefix;
+            }
+        }
+        let title = format!("{}:#1", rel);
+        bullets.push(format!("- {}: {}", title, text.trim()));
+    }
+    bullets
+}
+
+fn build_embedding_retrieval_text(sess: &Session, turn_input: &Vec<ResponseItem>, char_budget: usize) -> Option<String> {
+    let tmp = build_embedding_memory_injection_items(sess, turn_input, char_budget)?;
+    if let ResponseItem::Message { content, .. } = tmp {
+        if let Some(crate::models::ContentItem::InputText { text }) = content.into_iter().next() { return Some(text); }
+    }
+    None
+}
+
+fn build_summary_retrieval_text(sess: &Session, char_budget: usize) -> Option<String> {
+    let tmp = build_memory_injection_items(sess, char_budget)?;
+    if let ResponseItem::Message { content, .. } = tmp {
+        if let Some(crate::models::ContentItem::InputText { text }) = content.into_iter().next() { return Some(text); }
+    }
+    None
+}
+
+fn extract_latest_user_text(turn_input: &Vec<ResponseItem>) -> Option<String> {
+    for item in turn_input.iter().rev() {
+        if let ResponseItem::Message { role, content, .. } = item {
+            if role == "user" {
+                let mut s = String::new();
+                for c in content {
+                    if let ContentItem::InputText { text } | ContentItem::OutputText { text } = c { if !s.is_empty() { s.push(' ');} s.push_str(text) }
+                }
+                if !s.trim().is_empty() { return Some(s); }
+            }
+        }
+    }
+    None
+}
+
+/// Estimate text tokens from a list of response items using a simple heuristic (chars/4).
+fn estimate_tokens_for_items(items: &[ResponseItem]) -> usize {
+    let mut chars: usize = 0;
+    for it in items {
+        match it {
+            ResponseItem::Message { content, .. } => {
+                for c in content {
+                    match c {
+                        ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                            chars = chars.saturating_add(text.len());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Roughly 4 chars per token for English text
+    (chars + 3) / 4
+}
+
+/// Compute a conservative character budget for memory injection based on the model's
+/// context window, estimated size of the current turn input, and a fixed safety margin.
+fn compute_injection_char_budget(sess: &Session, turn_input: &Vec<ResponseItem>) -> usize {
+    let window_tokens = sess
+        .client
+        .get_model_context_window()
+        .unwrap_or(128_000);
+    let reserve_output = sess
+        .client
+        .get_model_max_output_tokens()
+        .unwrap_or(1_024);
+    let input_tokens = estimate_tokens_for_items(turn_input) as u64;
+    // Reserve a safety margin for instructions/tools/etc.
+    let safety_margin_tokens: u64 = 2_000;
+    // Also cap memory injection to at most 10% of the context window
+    let hard_cap_tokens: u64 = (window_tokens as f64 * 0.10) as u64;
+
+    let available = window_tokens
+        .saturating_sub(reserve_output)
+        .saturating_sub(input_tokens)
+        .saturating_sub(safety_margin_tokens);
+    let allowed_tokens = available.min(hard_cap_tokens);
+    if allowed_tokens == 0 { return 0; }
+    // Convert tokens to chars (4 chars per token heuristic)
+    (allowed_tokens as usize) * 4
+}
+
+/// Render the memory summaries into a single user-visible text block constrained by budgets.
+fn budget_summaries_to_text(
+    mut rows: Vec<crate::memory::store_jsonl::StoredSummary>,
+    repo_key: &str,
+    max_items: usize,
+    max_chars: usize,
+) -> Option<String> {
+    if rows.is_empty() || max_items == 0 || max_chars == 0 { return None; }
+    // Cap items to max_items (rows are newest first)
+    if rows.len() > max_items { rows.truncate(max_items); }
+
+    let mut remaining = max_chars;
+    let header = format!("[memory:summary v1 | repo={repo_key}]");
+    if header.len() + 1 > remaining { return None; }
+    let mut text = String::with_capacity(remaining.min(256));
+    text.push_str(&header);
+    text.push('\n');
+    remaining = remaining.saturating_sub(header.len() + 1);
+
+    for row in rows.into_iter() {
+        if remaining == 0 { break; }
+        let bullet_full = format!("- {}: {}", row.title, row.text);
+        if bullet_full.len() + 1 <= remaining {
+            text.push_str(&bullet_full);
+            text.push('\n');
+            remaining -= bullet_full.len() + 1;
+            continue;
+        }
+        // Need to truncate bullet to fit
+        if remaining <= 4 { break; } // can't fit meaningful content
+        let slice_len = remaining - 4; // space for " ..."
+        let truncated: String = bullet_full.chars().take(slice_len).collect();
+        text.push_str(&truncated);
+        text.push_str(" ...\n");
+        remaining = 0;
+        break;
+    }
+
+    if text.trim().is_empty() { None } else { Some(text) }
+}
+
+#[cfg(test)]
+mod memory_injection_tests {
+    use super::{budget_summaries_to_text, budget_hits_to_text, estimate_tokens_for_items, compute_injection_char_budget, blend_hits_with_recency, blend_hits_with_recency_with_params, dedupe_memory_against_code};
+    use crate::memory::store_jsonl::StoredSummary;
+    use codex_memory::store::SearchHit;
+    use crate::models::{ResponseItem, ContentItem};
+    use crate::config::{Config, ConfigOverrides, ConfigToml};
+    use crate::client::ModelClient;
+    use crate::model_provider_info::built_in_model_providers;
+    use crate::openai_tools::ToolsConfig;
+    use crate::protocol::AskForApproval;
+    use crate::protocol::Event;
+    use crate::shell;
+    use crate::debug_logger::DebugLogger;
+    use tempfile::TempDir;
+    use uuid::Uuid;
+    use std::sync::{Arc, Mutex};
+
+    fn row(title: &str, text: &str) -> StoredSummary {
+        StoredSummary {
+            repo_key: "rk".into(),
+            session_id: "s".into(),
+            ts: 1,
+            kind: "summary".into(),
+            title: title.into(),
+            text: text.into(),
+            msg_ids: vec![],
+        }
+    }
+
+    #[test]
+    fn budgets_exact_fit() {
+        let rows = vec![row("A", "B")];
+        let text = budget_summaries_to_text(rows, "/repo", 2, 100).unwrap();
+        assert!(text.contains("[memory:summary v1 | repo=/repo]"));
+        assert!(text.contains("- A: B"));
+    }
+
+    #[test]
+    fn budgets_truncates() {
+        let rows = vec![row("Title", &"x".repeat(200))];
+        // Very small budget that forces truncation but allows some content
+        let text = budget_summaries_to_text(rows, "/repo", 1, 60).unwrap();
+        assert!(text.contains("[memory:summary v1 | repo=/repo]"));
+        assert!(text.contains("- Title:"));
+        assert!(text.contains(" ..."));
+    }
+
+    #[test]
+    fn budgets_zero_caps_none() {
+        let rows = vec![row("t", "u")];
+        assert!(budget_summaries_to_text(rows.clone(), "/r", 0, 100).is_none());
+        assert!(budget_summaries_to_text(rows, "/r", 1, 0).is_none());
+    }
+
+    #[test]
+    fn budgets_multi_line_mixed_content() {
+        let mixed = "line1\nline2 with more text";
+        let rows = vec![row("Mix", mixed)];
+        // Small-ish budget; should include header and part of the bullet, preserving newline
+        let text = budget_summaries_to_text(rows, "/repo", 1, 60).unwrap();
+        assert!(text.contains("[memory:summary v1 | repo=/repo]"));
+        assert!(text.contains("- Mix: line1\n"));
+    }
+
+    #[test]
+    fn budget_hits_exact_and_truncate_and_zero() {
+        let hits = vec![
+            SearchHit { id: "a".into(), score: 0.9, title: "A".into(), text: "x".repeat(200), ts: 1 },
+            SearchHit { id: "b".into(), score: 0.8, title: "B".into(), text: "y".repeat(200), ts: 2 },
+        ];
+
+        // Exact-fit-ish generous budget
+        let text = budget_hits_to_text(hits.clone(), "/repo", 2, 500).unwrap();
+        assert!(text.contains("[memory:retrieval v1 | repo=/repo]"));
+        assert!(text.contains("- A:"));
+        assert!(text.contains("- B:"));
+
+        // Force truncation
+        let tiny = budget_hits_to_text(hits.clone(), "/repo", 1, 60).unwrap();
+        assert!(tiny.contains("[memory:retrieval v1 | repo=/repo]"));
+        assert!(tiny.contains("- A:"));
+        assert!(tiny.contains(" ..."));
+
+        // Zero budgets
+        assert!(budget_hits_to_text(Vec::new(), "/repo", 1, 100).is_none());
+        assert!(budget_hits_to_text(hits, "/repo", 0, 100).is_none());
+    }
+
+    #[test]
+    fn budget_hits_header_only_returns_none() {
+        let hits = vec![
+            SearchHit { id: "a".into(), score: 1.0, title: "A".into(), text: "x".repeat(200), ts: 1 },
+        ];
+        let header = format!("[memory:retrieval v1 | repo={}]", "/r");
+        // Budget that fits header + newline only, but no bullets
+        let budget = header.len() + 1;
+        assert!(budget_hits_to_text(hits, "/r", 1, budget).is_none());
+    }
+
+    #[test]
+    fn budget_hits_header_plus_truncated_bullet_returns_some() {
+        let hits = vec![
+            SearchHit { id: "a".into(), score: 1.0, title: "A".into(), text: "alpha".into(), ts: 1 },
+        ];
+        let header = format!("[memory:retrieval v1 | repo={}]", "/r");
+        // Budget that fits header + newline + a few chars of the bullet (must be >4 to allow truncation)
+        let budget = header.len() + 1 + 10;
+        let out = budget_hits_to_text(hits, "/r", 1, budget);
+        assert!(out.is_some());
+        let s = out.unwrap();
+        assert!(s.contains("[memory:retrieval v1 | repo=/r]"));
+        assert!(s.contains("- A:"));
+    }
+
+    #[test]
+    fn dedupe_does_not_remove_low_similarity() {
+        let code = "[memory:code v1 | repo=/r]\n- Util: alpha beta gamma delta epsilon zeta";
+        let mem = "[memory:retrieval v1 | repo=/r]\n- Util: alpha xi omicron\n- Other: different content";
+        let out = dedupe_memory_against_code(&code, &mem);
+        // Because content similarity is low (few overlapping tokens), Util should be kept
+        assert!(out.contains("- Util:"));
+        assert!(out.contains("- Other:"));
+    }
+
+    #[test]
+    fn dedupe_content_threshold_controls_removal() {
+        // Same title, content shares 3/5 tokens (0.6 Jaccard) without containment
+        let code = "[memory:code v1 | repo=/r]\n- TitleA: alpha beta gamma delta";
+        let mem  = "[memory:retrieval v1 | repo=/r]\n- TitleA: alpha beta gamma epsilon";
+
+        // High threshold: keep
+        let keep = super::dedupe_memory_against_code_with_thresholds(code, mem, 0.99, 0.8, 64);
+        assert!(keep.contains("- TitleA:"));
+
+        // Low threshold: remove (0.6 >= 0.6)
+        let removed = super::dedupe_memory_against_code_with_thresholds(code, mem, 0.99, 0.6, 64);
+        assert!(!removed.contains("- TitleA:"));
+    }
+
+    #[test]
+    fn dedupe_containment_prefix_controls_short_overlap() {
+        // No full containment but first 10 chars overlap strongly
+        let code = "[memory:code v1 | repo=/r]\n- T: lorem ipsum dolor";
+        let mem  = "[memory:retrieval v1 | repo=/r]\n- U: lorem ipsZZZ";
+
+        // Require long prefix -> keep
+        let keep = super::dedupe_memory_against_code_with_thresholds(code, mem, 1.0, 1.0, 16);
+        assert!(keep.contains("- U:"));
+
+        // Short prefix allows containment -> remove
+        let removed = super::dedupe_memory_against_code_with_thresholds(code, mem, 1.0, 1.0, 5);
+        assert!(!removed.contains("- U:"));
+    }
+
+    #[test]
+    fn estimate_tokens_sanity() {
+        let items = vec![
+            ResponseItem::Message { id: None, role: "user".into(), content: vec![
+                ContentItem::InputText { text: "abcd".into() },
+                ContentItem::OutputText { text: "12345678".into() },
+            ]},
+            ResponseItem::Message { id: None, role: "assistant".into(), content: vec![
+                ContentItem::InputText { text: "".into() },
+            ]},
+        ];
+        // 4 + 8 = 12 chars -> ~3 tokens with ceil rounding
+        assert_eq!(estimate_tokens_for_items(&items), 3);
+
+        let empty: Vec<ResponseItem> = Vec::new();
+        assert_eq!(estimate_tokens_for_items(&empty), 0);
+    }
+
+    #[test]
+    fn compute_budget_caps_and_zero() {
+        // Build a minimal Session with specific window/output settings
+        let tmp = TempDir::new().unwrap();
+        let mut base = ConfigToml::default();
+        base.model_context_window = Some(10_000);
+        base.model_max_output_tokens = Some(1_000);
+        let cfg = Config::load_from_base_config_with_overrides(
+            base,
+            ConfigOverrides::default(),
+            tmp.path().to_path_buf(),
+        ).expect("config load");
+
+        let debug_logger = Arc::new(Mutex::new(DebugLogger::new(false).unwrap()));
+        let provider = built_in_model_providers().get(&cfg.model_provider_id).unwrap().clone();
+        let client = ModelClient::new(
+            Arc::new(cfg.clone()),
+            None,
+            provider,
+            cfg.model_reasoning_effort,
+            cfg.model_reasoning_summary,
+            cfg.model_text_verbosity,
+            Uuid::new_v4(),
+            debug_logger,
+        );
+
+        let (tx_event, _) = async_channel::unbounded::<Event>();
+        let sess = super::Session {
+            client,
+            tx_event,
+            cwd: tmp.path().to_path_buf(),
+            base_instructions: None,
+            user_instructions: None,
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: cfg.sandbox_policy.clone(),
+            shell_environment_policy: cfg.shell_environment_policy.clone(),
+            writable_roots: vec![],
+            disable_response_storage: cfg.disable_response_storage,
+            tools_config: ToolsConfig::new(&cfg.model_family, cfg.approval_policy, cfg.sandbox_policy.clone(), cfg.include_plan_tool),
+            mcp_connection_manager: super::McpConnectionManager::default(),
+            agents: cfg.agents.clone(),
+            notify: cfg.notify.clone(),
+            state: std::sync::Mutex::new(super::State::default()),
+            rollout: std::sync::Mutex::new(None),
+            codex_linux_sandbox_exe: None,
+            user_shell: shell::Shell::Unknown,
+            show_raw_agent_reasoning: false,
+            pending_browser_screenshots: std::sync::Mutex::new(Vec::new()),
+            last_system_status: std::sync::Mutex::new(None),
+            last_screenshot_info: std::sync::Mutex::new(None),
+        };
+
+        // Input of ~100 tokens → window 10k, reserve 1k, safety 2k, cap 10% (1k)
+        let turn_input = vec![ResponseItem::Message {
+            id: None,
+            role: "user".into(),
+            content: vec![ContentItem::InputText { text: "x".repeat(400) }],
+        }];
+        let budget = compute_injection_char_budget(&sess, &turn_input);
+        // Hard cap should win: 1k tokens → 4k chars
+        assert_eq!(budget, 4_000);
+
+        // Small window that results in zero available
+        let mut base2 = ConfigToml::default();
+        base2.model_context_window = Some(1_000);
+        base2.model_max_output_tokens = Some(900);
+        let cfg2 = Config::load_from_base_config_with_overrides(
+            base2,
+            ConfigOverrides::default(),
+            tmp.path().to_path_buf(),
+        ).expect("config load");
+        let debug_logger2 = Arc::new(Mutex::new(DebugLogger::new(false).unwrap()));
+        let provider2 = built_in_model_providers().get(&cfg2.model_provider_id).unwrap().clone();
+        let client2 = ModelClient::new(
+            Arc::new(cfg2.clone()),
+            None,
+            provider2,
+            cfg2.model_reasoning_effort,
+            cfg2.model_reasoning_summary,
+            cfg2.model_text_verbosity,
+            Uuid::new_v4(),
+            debug_logger2,
+        );
+        let (tx_event2, _) = async_channel::unbounded::<Event>();
+        let sess2 = super::Session {
+            client: client2,
+            tx_event: tx_event2,
+            cwd: tmp.path().to_path_buf(),
+            base_instructions: None,
+            user_instructions: None,
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: cfg2.sandbox_policy.clone(),
+            shell_environment_policy: cfg2.shell_environment_policy.clone(),
+            writable_roots: vec![],
+            disable_response_storage: cfg2.disable_response_storage,
+            tools_config: ToolsConfig::new(&cfg2.model_family, cfg2.approval_policy, cfg2.sandbox_policy.clone(), cfg2.include_plan_tool),
+            mcp_connection_manager: super::McpConnectionManager::default(),
+            agents: cfg2.agents.clone(),
+            notify: cfg2.notify.clone(),
+            state: std::sync::Mutex::new(super::State::default()),
+            rollout: std::sync::Mutex::new(None),
+            codex_linux_sandbox_exe: None,
+            user_shell: shell::Shell::Unknown,
+            show_raw_agent_reasoning: false,
+            pending_browser_screenshots: std::sync::Mutex::new(Vec::new()),
+            last_system_status: std::sync::Mutex::new(None),
+            last_screenshot_info: std::sync::Mutex::new(None),
+        };
+        let budget2 = compute_injection_char_budget(&sess2, &turn_input);
+        assert_eq!(budget2, 0);
+    }
+
+    #[test]
+    fn blend_recency_prefers_newer_when_scores_equal() {
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let mut hits = vec![
+            SearchHit { id: "old".into(), score: 0.5, title: "t".into(), text: "x".into(), ts: now_ms - 30 * 24 * 60 * 60 * 1000 },
+            SearchHit { id: "new".into(), score: 0.5, title: "t".into(), text: "x".into(), ts: now_ms },
+        ];
+        blend_hits_with_recency(&mut hits);
+        assert_eq!(hits[0].id, "new");
+    }
+
+    #[test]
+    fn dedupe_memory_against_code_removes_overlap() {
+        let common = "abcdefghijklmnopqrstuvwxyz0123456789"; // 36 chars common prefix (> min 32)
+        let code = format!("[memory:code v1 | repo=/r]\n- Foo: {common} more code");
+        let mem = format!("[memory:retrieval v1 | repo=/r]\n- Foo: {common} and memory text\n- Bar: different content");
+        let out = dedupe_memory_against_code(&code, &mem);
+        assert!(out.contains("[memory:retrieval v1 | repo=/r]"));
+        // Overlapping Foo bullet should be removed, Bar remains
+        assert!(!out.contains("- Foo:"));
+        assert!(out.contains("- Bar:"));
+    }
+    
+    #[test]
+    fn recency_alpha_shifts_ranking() {
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let base = vec![
+            SearchHit { id: "old".into(), score: 0.60, title: "t".into(), text: "x".into(), ts: now_ms - 40 * 24 * 60 * 60 * 1000 },
+            SearchHit { id: "new".into(), score: 0.59, title: "t".into(), text: "x".into(), ts: now_ms },
+        ];
+        let mut a0 = base.clone();
+        blend_hits_with_recency_with_params(&mut a0, 0.0, 7.0);
+        assert_eq!(a0[0].id, "old");
+
+        let mut a1 = base.clone();
+        blend_hits_with_recency_with_params(&mut a1, 0.3, 7.0);
+        assert_eq!(a1[0].id, "new");
+    }
+
+    #[test]
+    fn recency_half_life_controls_decay() {
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let base = vec![
+            SearchHit { id: "old".into(), score: 0.62, title: "t".into(), text: "x".into(), ts: now_ms - 60 * 24 * 60 * 60 * 1000 },
+            SearchHit { id: "new".into(), score: 0.60, title: "t".into(), text: "x".into(), ts: now_ms },
+        ];
+        let mut short = base.clone();
+        blend_hits_with_recency_with_params(&mut short, 0.4, 3.0);
+        assert_eq!(short[0].id, "new");
+
+        let mut long = base.clone();
+        blend_hits_with_recency_with_params(&mut long, 0.1, 1000.0);
+        assert_eq!(long[0].id, "old");
     }
 }
 

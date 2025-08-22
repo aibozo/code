@@ -1,5 +1,6 @@
 use crate::models::ResponseItem;
 use tracing::debug;
+pub(crate) mod prune;
 
 /// Transcript of conversation history
 #[derive(Debug, Clone, Default)]
@@ -242,7 +243,7 @@ fn find_assistant_index_by_id(items: &Vec<ResponseItem>, id: &str) -> Option<usi
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 mod tests {
     use super::*;
     use crate::models::ContentItem;

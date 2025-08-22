@@ -87,6 +87,7 @@ use ratatui::widgets::ScrollbarOrientation;
 use ratatui::symbols::scrollbar as scrollbar_symbols;
 use serde::{Deserialize, Serialize};
 use codex_core::config::find_codex_home;
+use codex_core::memory::openai_embeddings::has_openai_api_key;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CachedConnection {
@@ -220,6 +221,9 @@ pub(crate) struct ChatWidget<'a> {
     // Performance tracing (opt-in via /perf)
     perf_enabled: bool,
     perf: std::cell::RefCell<PerfStats>,
+
+    // UX: allow user to hide/show memory injection notices
+    show_injection_notices: bool,
 }
 
 // Global guard to prevent overlapping background screenshot captures and to rate-limit them
@@ -410,6 +414,15 @@ fn create_initial_user_message(text: String, image_paths: Vec<PathBuf>) -> Optio
 }
 
 impl ChatWidget<'_> {
+    /// Push a Notice cell with the provided lines and redraw.
+    pub(crate) fn push_notice_lines(&mut self, lines: Vec<ratatui::text::Line<'static>>) {
+        if lines.is_empty() { return; }
+        self.history_cells.push(Box::new(history_cell::PlainHistoryCell {
+            lines,
+            kind: history_cell::HistoryCellType::Notice,
+        }));
+        self.request_redraw();
+    }
     fn perf_label_for_item(&self, item: &dyn HistoryCell) -> String {
         use crate::history_cell::{ExecKind, ExecStatus, HistoryCellType, PatchKind, ToolStatus};
         match item.kind() {
@@ -1044,7 +1057,7 @@ impl ChatWidget<'_> {
 
         // Initialize image protocol for rendering screenshots
 
-        let new_widget = Self {
+        let mut new_widget = Self {
             app_event_tx: app_event_tx.clone(),
             codex_op_tx,
             bottom_pane: BottomPane::new(BottomPaneParams {
@@ -1107,8 +1120,14 @@ impl ChatWidget<'_> {
             last_theme: crate::theme::current_theme(),
             perf_enabled: false,
             perf: std::cell::RefCell::new(PerfStats::default()),
+            show_injection_notices: true,
         };
-        
+        // Initialize footer compression hint state from config
+        new_widget
+            .bottom_pane
+            .set_compression_state(new_widget.config.memory.enabled);
+        new_widget.bottom_pane.set_compression_hint(true);
+
         // Note: Initial redraw needs to be triggered after widget is added to app_state
         // ready; trigger initial redraw
         
@@ -1121,6 +1140,18 @@ impl ChatWidget<'_> {
             tracing::info!("Initial animation detected, triggering redraw");
             self.mark_needs_redraw();
         }
+    }
+
+    /// Toggle visibility of per-turn memory/code injection notices.
+    pub(crate) fn toggle_injection_notices(&mut self) {
+        self.show_injection_notices = !self.show_injection_notices;
+        let status = if self.show_injection_notices {
+            "Injection notices shown"
+        } else {
+            "Injection notices hidden"
+        };
+        self.bottom_pane.update_status_text(status.to_string());
+        self.request_redraw();
     }
     
     /// Format model name with proper capitalization (e.g., "gpt-4" -> "GPT-4")
@@ -2274,9 +2305,11 @@ impl ChatWidget<'_> {
             }
             EventMsg::BackgroundEvent(BackgroundEventEvent { message }) => {
                 info!("BackgroundEvent: {message}");
-                // Surface lightweight background events in the history feed
-                // so users see confirmations (e.g., CDP connect success).
-                self.add_to_history(history_cell::new_background_event(message.clone()));
+                let is_injection_notice = message.starts_with("Injected code hints:");
+                // Show in history unless it's an injection notice and user hid them
+                if !is_injection_notice || self.show_injection_notices {
+                    self.add_to_history(history_cell::new_background_event(message.clone()));
+                }
 
                 // Also reflect CDP connect success in the status line.
                 if message.starts_with("✅ Connected to Chrome via CDP") {
@@ -2648,6 +2681,94 @@ impl ChatWidget<'_> {
             self.bottom_pane
                 .show_verbosity_selection(self.config.model_text_verbosity);
             return;
+        }
+    }
+
+    pub(crate) fn handle_memory_command(&mut self, command_args: String) {
+        // Show or set memory parameters.
+        let defaults = codex_core::config_types::MemoryConfig::default();
+        let args = command_args.trim();
+
+        if args.is_empty() || args.eq_ignore_ascii_case("show") {
+            let cur = &self.config.memory;
+            let msg = format!(
+                "Memory settings:\n- keep-last: {} (default: {})\n- summary-max-chars: {} (default: {})",
+                cur.keep_last_messages,
+                defaults.keep_last_messages,
+                cur.summary_max_chars,
+                defaults.summary_max_chars
+            );
+            self.add_to_history(history_cell::new_background_event(msg));
+            return;
+        }
+
+        // Accept forms: keep <N>, keep=<N>, summary <N>, summary=<N>
+        let mut keep_last: Option<usize> = None;
+        let mut summary_chars: Option<usize> = None;
+
+        let tokens: Vec<&str> = args.split_whitespace().collect();
+        let mut i = 0usize;
+        while i < tokens.len() {
+            let t = tokens[i];
+            let (k, v_opt) = if let Some((k, v)) = t.split_once('=') {
+                (k, Some(v))
+            } else if i + 1 < tokens.len() {
+                (t, Some(tokens[i + 1]))
+            } else {
+                (t, None)
+            };
+            match k.to_lowercase().as_str() {
+                "keep" | "keep-last" | "keep_last" => {
+                    if let Some(vs) = v_opt {
+                        if let Ok(v) = vs.parse::<usize>() {
+                            keep_last = Some(v);
+                        }
+                    }
+                    if v_opt.is_some() { i += 1; }
+                }
+                "summary" | "summary-max" | "summary_max_chars" => {
+                    if let Some(vs) = v_opt {
+                        if let Ok(v) = vs.parse::<usize>() {
+                            summary_chars = Some(v);
+                        }
+                    }
+                    if v_opt.is_some() { i += 1; }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+
+        if keep_last.is_none() && summary_chars.is_none() {
+            let msg = "Usage: /memory [show]|[keep <N>] [summary <CHARS>]".to_string();
+            self.add_to_history(history_cell::new_error_event(msg));
+            return;
+        }
+
+        if let Some(k) = keep_last { self.config.memory.keep_last_messages = k.max(1); }
+        if let Some(s) = summary_chars { self.config.memory.summary_max_chars = s.max(50); }
+
+        // Persist to config
+        match codex_core::config::find_codex_home() {
+            Ok(home) => {
+                if let Err(e) = codex_core::config::set_memory_config(&home, keep_last, summary_chars) {
+                    let msg = format!("Failed to save memory settings: {}", e);
+                    self.add_to_history(history_cell::new_error_event(msg));
+                    return;
+                }
+            }
+            Err(e) => {
+                let msg = format!("Could not locate Codex home to persist memory settings: {}", e);
+                self.add_to_history(history_cell::new_error_event(msg));
+                return;
+            }
+        }
+
+        let mut parts = Vec::new();
+        if let Some(k) = keep_last { parts.push(format!("keep-last set to {}", k.max(1))); }
+        if let Some(s) = summary_chars { parts.push(format!("summary-max-chars set to {}", s.max(50))); }
+        if !parts.is_empty() {
+            self.add_to_history(history_cell::new_background_event(parts.join("; ")));
         }
     }
 
@@ -3078,6 +3199,59 @@ impl ChatWidget<'_> {
         // Collapsed state changes affect heights; clear cache
         self.invalidate_height_cache();
         self.request_redraw();
+    }
+
+    /// Toggle semantic compression (memory) on/off at runtime.
+    /// - Enabling requires an OpenAI API key; if missing, show a notice and do nothing.
+    /// - Disabling always succeeds.
+    pub(crate) fn toggle_compression(&mut self, enhanced_keys_supported: bool) {
+        let currently_enabled = self.config.memory.enabled;
+        if !currently_enabled {
+            // Attempt to enable: require API key for embeddings-based compression.
+            if !has_openai_api_key(&self.config.codex_home) {
+                // Show friendly notice and abort
+                use ratatui::text::{Line, Span};
+                use ratatui::style::{Style, Modifier};
+                use ratatui::style::Stylize;
+                let mut lines: Vec<Line<'static>> = Vec::new();
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::raw("Compression: "),
+                    Span::styled(
+                        "Cannot enable — OpenAI API key missing",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                lines.push(Line::from("  Add a key to enable embeddings-based compression:"));
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    "code memory login".to_string().cyan(),
+                    Span::raw("  (prompts and saves to ~/.codex/auth.json)"),
+                ]));
+                lines.push(Line::from("  Or: code login --api-key sk-..."));
+                lines.push(Line::from(""));
+                self.push_notice_lines(lines);
+                self.bottom_pane.update_status_text("Compression requires an API key".to_string());
+                return;
+            }
+            // Enable compression and embeddings
+            self.config.memory.enabled = true;
+            self.config.memory.embedding.enabled = true;
+            self.bottom_pane.set_compression_state(true);
+            self.bottom_pane.update_status_text("Compression enabled".to_string());
+            if self.config.memory.code_index.enabled {
+                // Hint that we'll start indexing in the background during the next turn
+                self.bottom_pane.update_status_text("Indexing code…".to_string());
+            }
+        } else {
+            // Disable compression
+            self.config.memory.enabled = false;
+            self.bottom_pane.set_compression_state(false);
+            self.bottom_pane.update_status_text("Compression disabled".to_string());
+        }
+
+        // Restart conversation to apply updated config to the core session
+        self.new_conversation(enhanced_keys_supported);
     }
     
     pub(crate) fn is_reasoning_shown(&self) -> bool {
@@ -4455,6 +4629,15 @@ impl ChatWidget<'_> {
             enhanced_keys_supported,
             using_chatgpt_auth: self.config.using_chatgpt_auth,
         });
+
+        // Preserve the visible compression state indicator according to the
+        // current config. Without this, the freshly constructed composer
+        // defaults to "compression off" even when we just enabled it via
+        // Ctrl+X, which is confusing. This only updates the footer label;
+        // the actual enable/disable already happened before calling
+        // new_conversation().
+        self.bottom_pane
+            .set_compression_state(self.config.memory.enabled);
         
         // Request redraw for the new animation
         self.mark_needs_redraw();
