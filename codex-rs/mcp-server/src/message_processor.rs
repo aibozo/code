@@ -49,7 +49,7 @@ impl MessageProcessor {
     pub(crate) fn new(
         outgoing: OutgoingMessageSender,
         codex_linux_sandbox_exe: Option<PathBuf>,
-        config: Arc<Config>,
+        _config: Arc<Config>,
     ) -> Self {
         let outgoing = Arc::new(outgoing);
         let conversation_manager = Arc::new(ConversationManager::default());
@@ -57,7 +57,6 @@ impl MessageProcessor {
             conversation_manager.clone(),
             outgoing.clone(),
             codex_linux_sandbox_exe.clone(),
-            config,
         );
         Self {
             codex_message_processor,
