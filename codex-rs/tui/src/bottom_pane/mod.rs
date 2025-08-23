@@ -28,6 +28,7 @@ pub mod list_selection_view;
 mod textarea;
 mod theme_selection_view;
 mod verbosity_selection_view;
+mod reports_view;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CancellationEvent {
@@ -387,6 +388,14 @@ impl BottomPane<'_> {
         // Status shown in composer title now
         self.status_view_active = false;
         self.request_redraw()
+    }
+
+    /// Show harness reports viewer
+    pub fn show_reports_view(&mut self, lines: Vec<ratatui::text::Line<'static>>) {
+        let view = reports_view::ReportsView::new(lines);
+        self.active_view = Some(Box::new(view));
+        self.status_view_active = false;
+        self.request_redraw();
     }
 
     /// Height (terminal rows) required by the current bottom pane.

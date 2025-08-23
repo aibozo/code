@@ -242,6 +242,66 @@ impl App<'_> {
                     append_policy_log(&log_path, event);
                 }
             }
+
+            // Show harness results (latest + delta) if present
+            {
+                use ratatui::text::{Line, Span};
+                let harness_dir = config.cwd.join("harness").join("results");
+                if let Ok(entries) = std::fs::read_dir(&harness_dir) {
+                    let mut files: Vec<_> = entries
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.path().extension().map(|s| s == "json").unwrap_or(false))
+                        .collect();
+                    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+                    if let Some(last) = files.last() {
+                        let last_path = last.path();
+                        let last_val: Option<serde_json::Value> = std::fs::read_to_string(&last_path)
+                            .ok()
+                            .and_then(|s| serde_json::from_str(&s).ok());
+                        let prev_val: Option<serde_json::Value> = files
+                            .iter()
+                            .rev()
+                            .nth(1)
+                            .and_then(|e| std::fs::read_to_string(e.path()).ok())
+                            .and_then(|s| serde_json::from_str(&s).ok());
+                        if let Some(last_json) = last_val {
+                            let mut lines: Vec<Line<'static>> = Vec::new();
+                            let ts = last_json.get("timestamp").and_then(|v| v.as_str()).unwrap_or("unknown");
+                            lines.push(Line::from(Span::raw(format!("Harness: last run {ts}"))));
+                            // Summaries per stage
+                            let mut ok_cnt = 0usize;
+                            let mut err_cnt = 0usize;
+                            if let Some(stages) = last_json.get("stages").and_then(|v| v.as_array()) {
+                                for st in stages {
+                                    let name = st.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let status = st.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                                    match status { "ok" => ok_cnt += 1, "error" => err_cnt += 1, _ => {} }
+                                    lines.push(Line::from(format!("  - {}: {}", name, status)));
+                                }
+                            }
+                            // Delta vs previous
+                            if let Some(prev_json) = prev_val {
+                                let mut prev_ok = 0usize;
+                                let mut prev_err = 0usize;
+                                if let Some(stages) = prev_json.get("stages").and_then(|v| v.as_array()) {
+                                    for st in stages {
+                                        match st.get("status").and_then(|v| v.as_str()).unwrap_or("") {
+                                            "ok" => prev_ok += 1,
+                                            "error" => prev_err += 1,
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                let d_ok = ok_cnt as isize - prev_ok as isize;
+                                let d_err = err_cnt as isize - prev_err as isize;
+                                lines.push(Line::from(format!("  Δ stages ok: {d_ok:+}, error: {d_err:+}")));
+                            }
+                            lines.push(Line::from(""));
+                            chat_widget.push_notice_lines(lines);
+                        }
+                    }
+                }
+            }
             // If embeddings are enabled but no API key is configured, show a friendly notice.
             if config.memory.enabled && config.memory.embedding.enabled {
                 if !codex_core::memory::openai_embeddings::has_openai_api_key(&config.codex_home) {
@@ -519,6 +579,11 @@ impl App<'_> {
                     };
 
                     match command {
+                        SlashCommand::Reports => {
+                            if let AppState::Chat { widget } = &mut self.app_state {
+                                widget.show_reports_view();
+                            }
+                        }
                         SlashCommand::New => {
                             // Clear the current conversation and start fresh
                             if let AppState::Chat { widget } = &mut self.app_state {

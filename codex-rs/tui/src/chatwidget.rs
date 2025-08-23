@@ -423,6 +423,90 @@ impl ChatWidget<'_> {
         }));
         self.request_redraw();
     }
+
+    /// Build and show a harness reports view in the bottom pane.
+    pub(crate) fn show_reports_view(&mut self) {
+        use ratatui::text::{Line, Span};
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let harness_dir = self.config.cwd.join("harness").join("results");
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&harness_dir)
+            .ok()
+            .into_iter()
+            .flat_map(|it| it.filter_map(|e| e.ok()).map(|e| e.path()))
+            .filter(|p| p.extension().map(|s| s == "json").unwrap_or(false))
+            .collect();
+        files.sort();
+        if let Some(last) = files.last() {
+            let last_json: Option<serde_json::Value> = std::fs::read_to_string(last)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok());
+            if let Some(obj) = last_json {
+                let ts = obj.get("timestamp").and_then(|v| v.as_str()).unwrap_or("unknown");
+                lines.push(Line::from(vec![Span::raw("Harness Report • "), Span::raw(ts.to_string())]));
+                lines.push(Line::from(""));
+                if let Some(stages) = obj.get("stages").and_then(|v| v.as_array()) {
+                    for st in stages {
+                        let name = st.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                        let status = st.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                        lines.push(Line::from(format!("{name}: {status}")));
+                        if let Some(metrics) = st.get("metrics").and_then(|v| v.as_object()) {
+                            for (k, v) in metrics {
+                                // Render scalar metrics compactly
+                                let val = if v.is_string() || v.is_number() || v.is_boolean() {
+                                    v.to_string()
+                                } else {
+                                    // For arrays/objects, render a short JSON
+                                    match serde_json::to_string(v) { Ok(s) => s, Err(_) => "{}".to_string() }
+                                };
+                                lines.push(Line::from(format!("  - {k}: {val}")));
+                            }
+                        }
+                    }
+                }
+                // Previous run delta summary
+                if files.len() >= 2 {
+                    if let Some(prev) = files.get(files.len() - 2) {
+                        let prev_json: Option<serde_json::Value> = std::fs::read_to_string(prev)
+                            .ok()
+                            .and_then(|s| serde_json::from_str(&s).ok());
+                        if let Some(prev_obj) = prev_json {
+                            let mut ok_now = 0isize;
+                            let mut err_now = 0isize;
+                            let mut ok_prev = 0isize;
+                            let mut err_prev = 0isize;
+                            if let Some(stages) = obj.get("stages").and_then(|v| v.as_array()) {
+                                for st in stages {
+                                    match st.get("status").and_then(|v| v.as_str()).unwrap_or("") {
+                                        "ok" => ok_now += 1,
+                                        "error" => err_now += 1,
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            if let Some(stages) = prev_obj.get("stages").and_then(|v| v.as_array()) {
+                                for st in stages {
+                                    match st.get("status").and_then(|v| v.as_str()).unwrap_or("") {
+                                        "ok" => ok_prev += 1,
+                                        "error" => err_prev += 1,
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            let d_ok = ok_now - ok_prev;
+                            let d_err = err_now - err_prev;
+                            lines.push(Line::from(""));
+                            lines.push(Line::from(format!("Δ vs previous • ok: {:+}, error: {:+}", d_ok, d_err)));
+                        }
+                    }
+                }
+            } else {
+                lines.push(Line::from("No parsable harness results found."));
+            }
+        } else {
+            lines.push(Line::from("No harness results yet. Run: code harness run"));
+        }
+        self.bottom_pane.show_reports_view(lines);
+    }
     fn perf_label_for_item(&self, item: &dyn HistoryCell) -> String {
         use crate::history_cell::{ExecKind, ExecStatus, HistoryCellType, PatchKind, ToolStatus};
         match item.kind() {
