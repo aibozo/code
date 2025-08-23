@@ -1,6 +1,6 @@
 # Self-Improvement Harness
 
-This directory contains planning docs for the `feature/self-improvement-harness` branch.
+This directory contains planning docs for the `self-improvement-harness` branch.
 
 Scope:
 - Capability profiles and sandbox wiring
@@ -10,4 +10,3 @@ Scope:
 - Orchestrator loop design
 
 Each milestone has a PR spec under `docs/prs/` with acceptance criteria.
-
