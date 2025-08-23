@@ -26,6 +26,7 @@ use crate::protocol::SandboxPolicy;
 use crate::seatbelt::spawn_command_under_seatbelt;
 use crate::spawn::StdioPolicy;
 use crate::spawn::spawn_child_async;
+use crate::policy_yaml::{PolicyYaml, append_policy_log};
 use serde_bytes::ByteBuf;
 
 // Maximum we send for each stream, which is either:
@@ -83,6 +84,48 @@ pub async fn process_exec_tool_call(
     stdout_stream: Option<StdoutStream>,
 ) -> Result<ExecToolCallOutput> {
     let start = Instant::now();
+
+    // Light policy warning/logging before execution (M0):
+    // Read configs/policy.yaml and warn if command not in allowed list for current level.
+    if let Some(py) = PolicyYaml::load_from_repo(&params.cwd) {
+        if let Some(level) = py.active_level() {
+            let allowed = py.allowed_for_level(level);
+            if let Some(cmd0) = params.command.first() {
+                // Compare base program name if path provided
+                let prog = std::path::Path::new(cmd0)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| cmd0.clone());
+                if !allowed.contains(&prog) && !allowed.contains(cmd0) {
+                    // Send a small prefix to the command's stdout stream if available
+                    if let Some(s) = &stdout_stream {
+                        let msg = format!(
+                            "[policy] Warning: '{}' not allowed for level {} (will proceed)\n",
+                            prog, level
+                        );
+                        let _ = s.tx_event.try_send(Event {
+                            id: s.sub_id.clone(),
+                            msg: EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+                                call_id: s.call_id.clone(),
+                                stream: ExecOutputStream::Stdout,
+                                chunk: ByteBuf::from(msg.into_bytes()),
+                            }),
+                        });
+                    }
+                    // Append to policy log
+                    let log_path = py.policy_log_path(&params.cwd);
+                    let event = serde_json::json!({
+                        "ts": chrono::Utc::now().to_rfc3339(),
+                        "event": "warn_disallowed_command",
+                        "profile": level,
+                        "command": params.command,
+                        "cwd": params.cwd,
+                    });
+                    append_policy_log(&log_path, event);
+                }
+            }
+        }
+    }
 
     let raw_output_result: std::result::Result<RawExecToolCallOutput, CodexErr> = match sandbox_type
     {

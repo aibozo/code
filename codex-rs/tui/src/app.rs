@@ -14,6 +14,7 @@ use codex_core::ConversationManager;
 use codex_core::config::Config;
 use codex_core::protocol::Event;
 use codex_core::protocol::Op;
+use codex_core::policy_yaml::{PolicyYaml, append_policy_log};
 use color_eyre::eyre::Result;
 use crossterm::SynchronizedUpdate;
 use crossterm::event::KeyCode;
@@ -187,6 +188,60 @@ impl App<'_> {
             );
             // Check for initial animations after widget is created
             chat_widget.check_for_initial_animations();
+            // Show initial policy/profile status and write a policy log entry
+            {
+                use ratatui::text::{Line, Span};
+                use ratatui::style::{Style, Modifier};
+                use ratatui::style::Stylize;
+                let mut lines: Vec<Line<'static>> = Vec::new();
+                let profile_str = {
+                    // Map sandbox to capability profile for display
+                    match &config.sandbox_policy {
+                        codex_core::protocol::SandboxPolicy::ReadOnly => "READ_ONLY",
+                        codex_core::protocol::SandboxPolicy::WorkspaceWrite { .. } => "WORKSPACE_WRITE",
+                        codex_core::protocol::SandboxPolicy::DangerFullAccess => "GODMODE",
+                    }
+                    .to_string()
+                };
+                let approvals_str = format!("{:?}", config.approval_policy).to_lowercase().replace('_', "-");
+                let sandbox_str = match &config.sandbox_policy {
+                    codex_core::protocol::SandboxPolicy::ReadOnly => "read-only".to_string(),
+                    codex_core::protocol::SandboxPolicy::WorkspaceWrite { network_access, .. } => {
+                        if *network_access { "workspace-write+net".to_string() } else { "workspace-write".to_string() }
+                    }
+                    codex_core::protocol::SandboxPolicy::DangerFullAccess => "danger-full-access".to_string(),
+                };
+
+                let mut header = Vec::new();
+                header.push(Span::raw(" "));
+                header.push(Span::styled("Profile:", Style::default().add_modifier(Modifier::BOLD)));
+                header.push(Span::raw(" "));
+                header.push(Span::styled(profile_str.clone(), Style::default()));
+                header.push(Span::raw("  "));
+                header.push(Span::styled("Approvals:", Style::default().add_modifier(Modifier::BOLD)));
+                header.push(Span::raw(" "));
+                header.push(Span::styled(approvals_str.clone(), Style::default()));
+                header.push(Span::raw("  "));
+                header.push(Span::styled("Sandbox:", Style::default().add_modifier(Modifier::BOLD)));
+                header.push(Span::raw(" "));
+                header.push(Span::styled(sandbox_str.clone(), Style::default()));
+                lines.push(Line::from(header));
+                lines.push(Line::from(""));
+                chat_widget.push_notice_lines(lines);
+
+                // Attempt to read policy.yaml and log startup
+                if let Some(py) = PolicyYaml::load_from_repo(&config.cwd) {
+                    let log_path = py.policy_log_path(&config.cwd);
+                    let event = serde_json::json!({
+                        "ts": chrono::Utc::now().to_rfc3339(),
+                        "event": "startup",
+                        "profile": profile_str,
+                        "approvals": approvals_str,
+                        "sandbox": sandbox_str,
+                    });
+                    append_policy_log(&log_path, event);
+                }
+            }
             // If embeddings are enabled but no API key is configured, show a friendly notice.
             if config.memory.enabled && config.memory.embedding.enabled {
                 if !codex_core::memory::openai_embeddings::has_openai_api_key(&config.codex_home) {
