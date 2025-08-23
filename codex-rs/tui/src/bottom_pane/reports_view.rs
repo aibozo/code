@@ -20,11 +20,12 @@ pub(crate) struct ReportsView {
     scroll: u16,
     app_event_tx: AppEventSender,
     nav: Option<ReportsNav>,
+    complete: bool,
 }
 
 impl ReportsView {
     pub fn new(lines: Vec<Line<'static>>, app_event_tx: AppEventSender, nav: Option<ReportsNav>) -> Self {
-        Self { lines, scroll: 0, app_event_tx, nav }
+        Self { lines, scroll: 0, app_event_tx, nav, complete: false }
     }
 }
 
@@ -38,16 +39,25 @@ impl BottomPaneView<'_> for ReportsView {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
+        if area.height == 0 || area.width == 0 { return; }
+        // Reserve 1 row for footer hints
+        let content_h = area.height.saturating_sub(1);
+        let content_area = Rect { x: area.x, y: area.y, width: area.width, height: content_h };
+
         // Render a scrolled paragraph of the report
         let mut lines = self.lines.clone();
-        // Manual scroll by removing top lines (simple; adequate for now)
         let skip = self.scroll as usize;
-        if skip < lines.len() {
-            lines.drain(0..skip);
+        if skip < lines.len() { lines.drain(0..skip); } else { lines.clear(); }
+        Paragraph::new(lines).wrap(Wrap { trim: false }).render_ref(content_area, buf);
+
+        // Footer hint line
+        let footer_area = Rect { x: area.x, y: area.y.saturating_add(content_h), width: area.width, height: 1 };
+        let hint = if self.nav.is_some() {
+            "↑/↓/PgUp/PgDn scroll   •   ←/→ switch run   •   Esc close"
         } else {
-            lines.clear();
-        }
-        Paragraph::new(lines).wrap(Wrap { trim: false }).render_ref(area, buf);
+            "↑/↓/PgUp/PgDn scroll   •   Esc close"
+        };
+        Paragraph::new(Line::from(hint)).wrap(Wrap { trim: false }).render_ref(footer_area, buf);
     }
 
     fn handle_key_event(&mut self, _pane: &mut BottomPane<'_>, key: crossterm::event::KeyEvent) {
@@ -94,11 +104,18 @@ impl BottomPaneView<'_> for ReportsView {
                     }
                 }
             }
+            KeyCode::Esc => {
+                self.complete = true;
+            }
             _ => {}
         }
     }
 
     fn update_status_text(&mut self, _text: String) -> ConditionalUpdate {
         ConditionalUpdate::NoRedraw
+    }
+
+    fn is_complete(&self) -> bool {
+        self.complete
     }
 }
