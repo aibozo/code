@@ -80,6 +80,9 @@ enum Subcommand {
 
     /// Memory utilities (semantic compression helpers).
     Memory(MemoryCommand),
+
+    /// Run the evaluation harness.
+    Harness(HarnessCommand),
 }
 
 #[derive(Debug, Parser)]
@@ -167,6 +170,28 @@ struct MemoryLoginCommand {
 #[derive(Debug, Parser)]
 struct MemoryReindexCommand {}
 
+#[derive(Debug, Parser)]
+struct HarnessCommand {
+    #[clap(skip)]
+    config_overrides: CliConfigOverrides,
+
+    #[command(subcommand)]
+    action: HarnessSubcommand,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum HarnessSubcommand {
+    /// Run harness stages and write a result JSON.
+    Run(HarnessRunCommand),
+}
+
+#[derive(Debug, Parser)]
+struct HarnessRunCommand {
+    /// RNG seed for deterministic runs.
+    #[arg(long = "seed", value_name = "N")]
+    seed: Option<u64>,
+}
+
 fn main() -> anyhow::Result<()> {
     arg0_dispatch_or_else(|codex_linux_sandbox_exe| async move {
         cli_main(codex_linux_sandbox_exe).await?;
@@ -252,6 +277,14 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 }
                 MemorySubcommand::Reindex(_cmd) => {
                     memory_reindex(mem_cli.config_overrides).await?;
+                }
+            }
+        }
+        Some(Subcommand::Harness(mut h_cli)) => {
+            prepend_config_flags(&mut h_cli.config_overrides, cli.config_overrides);
+            match h_cli.action {
+                HarnessSubcommand::Run(cmd) => {
+                    harness_run(h_cli.config_overrides, cmd).await?;
                 }
             }
         }
@@ -375,4 +408,31 @@ fn print_completion(cmd: CompletionCommand) {
     let mut app = MultitoolCli::command();
     let name = "codex";
     generate(cmd.shell, &mut app, name, &mut std::io::stdout());
+}
+
+async fn harness_run(
+    cli_config_overrides: CliConfigOverrides,
+    cmd: HarnessRunCommand,
+) -> anyhow::Result<()> {
+    // Load config to resolve cwd (repo root)
+    let cfg = codex_core::config::Config::load_with_cli_overrides(
+        cli_config_overrides
+            .parse_overrides()
+            .map_err(|e| anyhow::anyhow!(e))?,
+        codex_core::config::ConfigOverrides::default(),
+    )?;
+    let harness = cfg.cwd.join("harness").join("run.sh");
+    if !harness.is_file() {
+        anyhow::bail!(format!("Harness runner not found at {}", harness.display()));
+    }
+    let mut command = tokio::process::Command::new(&harness);
+    command.current_dir(&cfg.cwd);
+    if let Some(seed) = cmd.seed {
+        command.arg("--seed").arg(seed.to_string());
+    }
+    let status = command.status().await?;
+    if !status.success() {
+        anyhow::bail!(format!("Harness run failed with status {}", status));
+    }
+    Ok(())
 }
