@@ -186,6 +186,9 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             EventMsg::TokenCount(token_usage) => {
                 ts_println!(self, "tokens used: {}", token_usage.blended_total());
             }
+            EventMsg::TokenContextUpdate(_) => {
+                // Status-only token context update; no terminal output needed.
+            }
             EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta }) => {
                 if !self.answer_started {
                     ts_println!(self, "{}\n", "codex".style(self.italic).style(self.magenta));

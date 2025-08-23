@@ -581,6 +581,26 @@ pub struct MemoryConfig {
     /// Model to use for LLM summaries (OpenAI).
     #[serde(default = "MemoryConfig::default_summarizer_model")]
     pub summarizer_model: String,
+
+    /// Preflight compaction thresholds as percentages of the effective window.
+    /// When the estimated formatted input exceeds the lowest threshold, preflight
+    /// compaction is applied until the target percentage is reached.
+    #[serde(default = "MemoryConfig::default_compact_threshold_pct")]
+    pub compact_threshold_pct: Vec<u8>,
+
+    /// Target percentage for hysteresis when compacting. Should be lower than
+    /// the lowest threshold to avoid thrash.
+    #[serde(default = "MemoryConfig::default_compact_target_pct")]
+    pub compact_target_pct: u8,
+
+    /// Character budget for per‑volley summaries used by preflight compaction.
+    #[serde(default = "MemoryConfig::default_summary_max_chars_per_volley")]
+    pub summary_max_chars_per_volley: usize,
+
+    /// Maximum number of volley summaries to insert in a single request during
+    /// preflight compaction.
+    #[serde(default = "MemoryConfig::default_max_summaries_per_request")]
+    pub max_summaries_per_request: usize,
 }
 
 impl MemoryConfig {
@@ -595,6 +615,10 @@ impl MemoryConfig {
     fn default_summary_max_chars() -> usize { 400 }
     fn default_use_llm_summarizer() -> bool { true }
     fn default_summarizer_model() -> String { "gpt-5-nano".to_string() }
+    fn default_compact_threshold_pct() -> Vec<u8> { vec![75, 85, 95] }
+    fn default_compact_target_pct() -> u8 { 70 }
+    fn default_summary_max_chars_per_volley() -> usize { 400 }
+    fn default_max_summaries_per_request() -> usize { 5 }
 }
 
 impl Default for MemoryConfig {
@@ -615,6 +639,10 @@ impl Default for MemoryConfig {
             summary_max_chars: Self::default_summary_max_chars(),
             use_llm_summarizer: Self::default_use_llm_summarizer(),
             summarizer_model: Self::default_summarizer_model(),
+            compact_threshold_pct: Self::default_compact_threshold_pct(),
+            compact_target_pct: Self::default_compact_target_pct(),
+            summary_max_chars_per_volley: Self::default_summary_max_chars_per_volley(),
+            max_summaries_per_request: Self::default_max_summaries_per_request(),
         }
     }
 }

@@ -259,6 +259,7 @@ async fn run_codex_tool_session_inner(
                     | EventMsg::AgentReasoningRawContentDelta(_)
                     | EventMsg::TaskStarted
                     | EventMsg::TokenCount(_)
+                    | EventMsg::TokenContextUpdate(_)
                     | EventMsg::AgentReasoning(_)
                     | EventMsg::AgentReasoningSectionBreak(_)
                     | EventMsg::McpToolCallBegin(_)

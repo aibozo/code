@@ -380,11 +380,11 @@ impl ChatComposer {
         last_token_usage: TokenUsage,
         model_context_window: Option<u64>,
     ) {
-        let initial_prompt_tokens = self
-            .token_usage_info
-            .as_ref()
-            .map(|info| info.initial_prompt_tokens)
-            .unwrap_or_else(|| last_token_usage.cached_input_tokens.unwrap_or(0));
+        // Use the current turn's cached input tokens as a dynamic baseline so
+        // the context-left percentage reflects changes from semantic
+        // compression (summarization/pruning) and prompt caching across
+        // turns. Falling back to 0 when the provider does not report a value.
+        let initial_prompt_tokens = last_token_usage.cached_input_tokens.unwrap_or(0);
 
         self.token_usage_info = Some(TokenUsageInfo {
             total_token_usage,
@@ -1295,15 +1295,11 @@ impl WidgetRef for &ChatComposer {
                     if let Some(context_window) = token_usage_info.model_context_window {
                         let last_token_usage = &token_usage_info.last_token_usage;
                         let baseline = token_usage_info.initial_prompt_tokens;
-                        let percent_remaining: u8 = if context_window > baseline {
-                            let effective_window = context_window - baseline;
-                            let used = last_token_usage
-                                .tokens_in_context_window()
-                                .saturating_sub(baseline);
-                            let remaining = effective_window.saturating_sub(used);
-                            ((remaining as f32 / effective_window as f32) * 100.0)
-                                .clamp(0.0, 100.0) as u8
-                        } else { 0 };
+                        let percent_remaining: u8 =
+                            last_token_usage.percent_of_context_window_remaining(
+                                context_window,
+                                baseline,
+                            );
                         token_spans.push(Span::from("(").style(label_style));
                         token_spans.push(Span::from(percent_remaining.to_string()).style(label_style.add_modifier(Modifier::BOLD)));
                         token_spans.push(Span::from("% left)").style(label_style));

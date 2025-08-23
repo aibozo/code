@@ -94,6 +94,7 @@ pub async fn run_conversation_loop(
                     | EventMsg::AgentReasoningRawContentDelta(_)
                     | EventMsg::TaskStarted
                     | EventMsg::TokenCount(_)
+                    | EventMsg::TokenContextUpdate(_)
                     | EventMsg::AgentReasoning(_)
                     | EventMsg::AgentReasoningSectionBreak(_)
                     | EventMsg::McpToolCallBegin(_)

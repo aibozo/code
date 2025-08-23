@@ -2100,6 +2100,15 @@ impl ChatWidget<'_> {
                     self.config.model_context_window,
                 );
             }
+            EventMsg::TokenContextUpdate(token_usage) => {
+                // Status-only update: refresh percent-left without accumulating totals.
+                self.last_token_usage = token_usage;
+                self.bottom_pane.set_token_usage(
+                    self.total_token_usage.clone(),
+                    self.last_token_usage.clone(),
+                    self.config.model_context_window,
+                );
+            }
             EventMsg::Error(ErrorEvent { message }) => {
                 self.on_error(message);
             }

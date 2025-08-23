@@ -297,6 +297,8 @@ use crate::openai_tools::get_openai_tools;
 use crate::parse_command::parse_command;
 use crate::plan_tool::handle_update_plan;
 use crate::project_doc::get_user_instructions;
+use crate::memory::summarizer::{Summarizer, CompactSummarizer};
+use crate::conversation_history::volley::{segment_into_volleys, filter_compaction_candidates};
 use crate::protocol::AgentMessageDeltaEvent;
 use crate::protocol::AgentMessageEvent;
 use crate::protocol::AgentReasoningDeltaEvent;
@@ -440,6 +442,8 @@ struct State {
     pending_approvals: HashMap<String, oneshot::Sender<ReviewDecision>>,
     pending_input: Vec<ResponseInputItem>,
     history: ConversationHistory,
+    /// Last completed turn's provider-reported token usage (for baselining post-prune updates)
+    last_completed_token_usage: Option<crate::protocol::TokenUsage>,
     /// Tracks which completed agents (by id) have already been returned to the
     /// model for a given batch when using `agent_wait` without `return_all`.
     /// This enables sequential waiting behavior across multiple calls.
@@ -1860,14 +1864,42 @@ async fn run_agent(sess: Arc<Session>, sub_id: String, input: Vec<InputItem>) {
                 keep_last_messages,
             );
 
-            let mut state = sess.state.lock().unwrap();
-            let maybe_summary = pruner.summarize_then_prune(
-                &mut state.history,
-                &*summarizer_box,
-                &store,
-                &repo_key,
-                sess.client.get_session_id(),
-            );
+            let (maybe_summary, post_prune) = {
+                let mut state = sess.state.lock().unwrap();
+                let maybe_summary = pruner.summarize_then_prune(
+                    &mut state.history,
+                    &*summarizer_box,
+                    &store,
+                    &repo_key,
+                    sess.client.get_session_id(),
+                );
+                // After pruning, compute a status-only token context update so the UI can
+                // refresh the percent-left indicator immediately without changing totals.
+                let baseline_cached = state
+                    .last_completed_token_usage
+                    .as_ref()
+                    .and_then(|u| u.cached_input_tokens)
+                    .unwrap_or(0);
+                let remaining_items = state.history.contents();
+                let est_tokens = estimate_tokens_for_items(&remaining_items) as u64;
+                let post_prune = crate::protocol::TokenUsage {
+                    // Treat total as baseline + estimated remaining to make
+                    // tokens_in_context_window() - baseline ~= est_tokens.
+                    input_tokens: est_tokens.saturating_add(baseline_cached),
+                    cached_input_tokens: Some(baseline_cached),
+                    output_tokens: 0,
+                    reasoning_output_tokens: Some(0),
+                    total_tokens: est_tokens.saturating_add(baseline_cached),
+                };
+                (maybe_summary, post_prune)
+            };
+            sess.tx_event
+                .send(Event {
+                    id: sub_id.clone(),
+                    msg: EventMsg::TokenContextUpdate(post_prune),
+                })
+                .await
+                .ok();
 
             // If embeddings are enabled and an API key is configured, embed and persist the vector.
             if mem_cfg.embedding.enabled && has_openai_api_key(sess.client.get_codex_home()) {
@@ -3020,6 +3052,12 @@ async fn try_run_turn(
         })
     };
 
+    // Apply preflight compaction if needed to ensure prompt fits in context window
+    let prompt: Cow<Prompt> = match preflight_compact_if_needed(sess, &prompt) {
+        std::borrow::Cow::Borrowed(_) => prompt,
+        std::borrow::Cow::Owned(p2) => Cow::Owned(p2),
+    };
+
     let mut stream = sess.client.clone().stream(&prompt).await?;
 
     let mut output = Vec::new();
@@ -3059,6 +3097,11 @@ async fn try_run_turn(
                 token_usage,
             } => {
                 if let Some(token_usage) = token_usage {
+                    // Remember last completed token usage for baseline in post-prune updates
+                    {
+                        let mut st = sess.state.lock().unwrap();
+                        st.last_completed_token_usage = Some(token_usage.clone());
+                    }
                     sess.tx_event
                         .send(Event {
                             id: sub_id.to_string(),
@@ -3067,7 +3110,7 @@ async fn try_run_turn(
                         .await
                         .ok();
                 }
-
+                
                 let unified_diff = turn_diff_tracker.get_unified_diff();
                 if let Ok(Some(unified_diff)) = unified_diff {
                     let msg = EventMsg::TurnDiff(TurnDiffEvent { unified_diff });
@@ -3124,6 +3167,127 @@ async fn try_run_turn(
             }
         }
     }
+}
+
+/// Ensure the formatted request fits in the model's context window.
+/// If it exceeds the budget, replace older history with a compact summary and keep
+/// a small tail of recent messages. Does not mutate persistent history; only the prompt.
+fn preflight_compact_if_needed<'a>(sess: &Session, prompt: &'a Prompt) -> std::borrow::Cow<'a, Prompt> {
+    // Compute effective budget
+    let window_tokens = sess.client.get_model_context_window().unwrap_or(128_000);
+    let reserve_output = sess.client.get_model_max_output_tokens().unwrap_or(1_024);
+    let safety_margin_tokens: u64 = 2_000;
+    let effective_window = window_tokens.saturating_sub(reserve_output).saturating_sub(safety_margin_tokens);
+    let hard_limit = effective_window;
+
+    // Fast path – already fits
+    let mut formatted = prompt.get_formatted_input();
+    let mut est = estimate_tokens_for_items(&formatted) as u64;
+    let mem_cfg = sess.client.get_memory_config();
+    let thresholds = if mem_cfg.compact_threshold_pct.is_empty() { vec![75,85,95] } else { mem_cfg.compact_threshold_pct.clone() };
+    let target_pct: u64 = mem_cfg.compact_target_pct as u64;
+    let used_pct = ((est as f64) / (effective_window as f64) * 100.0) as u64;
+    if est <= hard_limit && used_pct < thresholds.iter().min().copied().unwrap_or(75) as u64 {
+        return std::borrow::Cow::Borrowed(prompt);
+    }
+
+    // Work on a clone we can modify
+    let mut p = prompt.clone();
+
+    // If the first item is a memory/code injection block, keep it separate so we can drop it as a last resort.
+    let (mut injection_prefix, mut rest): (Vec<ResponseItem>, Vec<ResponseItem>) = match p.input.split_first() {
+        Some((ResponseItem::Message { content, .. }, tail)) if content.iter().any(|c| matches!(c, ContentItem::InputText { text } if text.starts_with("[memory:"))) => {
+            (vec![p.input[0].clone()], tail.to_vec())
+        }
+        _ => (Vec::new(), p.input.clone()),
+    };
+
+    // Protect recent volleys: derive a small count from keep_last_messages (message-based).
+    let mut protect_tail_volleys: usize = (mem_cfg.keep_last_messages / 2).clamp(1, 5);
+    let repo_key = crate::util::repo_key(&sess.cwd);
+    let mut summary_max_chars: usize = mem_cfg.summary_max_chars_per_volley.max(200);
+    let mut injection_dropped = false;
+    let max_summaries = mem_cfg.max_summaries_per_request.max(1);
+    let mut summaries_inserted = 0usize;
+
+    // Loop with safety bound
+    for _ in 0..64 {
+        // Build volley candidates on the current rest
+        let volleys = segment_into_volleys(&rest);
+        if volleys.is_empty() { break; }
+
+        // Exclude the last N volleys from compaction
+        let protect_start_item_idx = if protect_tail_volleys >= volleys.len() { 0 } else { volleys[volleys.len() - protect_tail_volleys].start };
+        let mut cands = filter_compaction_candidates(&rest, &volleys)
+            .into_iter()
+            .filter(|r| r.start < protect_start_item_idx)
+            .collect::<Vec<_>>();
+
+        if cands.is_empty() {
+            // Reduce protection first, then shrink summary, then drop injection
+            if protect_tail_volleys > 1 { protect_tail_volleys -= 1; continue; }
+            if summary_max_chars > 200 { summary_max_chars = ((summary_max_chars as f32) * 0.7) as usize; summary_max_chars = summary_max_chars.max(200); continue; }
+            if !injection_dropped && !injection_prefix.is_empty() {
+                injection_prefix.clear();
+                injection_dropped = true;
+                // Rebuild p.input to reflect injection removal
+                p.input = rest.clone();
+                formatted = p.get_formatted_input();
+                est = estimate_tokens_for_items(&formatted) as u64;
+                if est <= hard_limit { break; }
+                continue;
+            }
+            break;
+        }
+
+        // Summarize the oldest candidate volley
+        let r = cands.remove(0);
+        let slice = &rest[r.start..r.end];
+        let summarizer = CompactSummarizer::new(summary_max_chars);
+        if let Some(summary) = summarizer.summarize(slice) {
+            let header = format!("[memory:context v1 | repo={repo_key}]");
+            let text = format!("{header}\n{}\n{}", summary.title, summary.text);
+            let summary_item = ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText { text }],
+            };
+            // Replace the slice with a single summary item
+            let mut new_rest: Vec<ResponseItem> = Vec::with_capacity(rest.len() - (r.end - r.start) + 1);
+            new_rest.extend_from_slice(&rest[..r.start]);
+            new_rest.push(summary_item);
+            new_rest.extend_from_slice(&rest[r.end..]);
+            rest = new_rest;
+
+            // Rebuild prompt input
+            if injection_prefix.is_empty() { p.input = rest.clone(); } else { p.input = [injection_prefix.clone(), rest.clone()].concat(); }
+
+            // Re‑estimate
+            formatted = p.get_formatted_input();
+            est = estimate_tokens_for_items(&formatted) as u64;
+            summaries_inserted = summaries_inserted.saturating_add(1);
+            let used_pct = ((est as f64) / (effective_window as f64) * 100.0) as u64;
+            let target_tokens = (target_pct.min(99) as f64 / 100.0 * effective_window as f64) as u64;
+            if est <= target_tokens || used_pct < thresholds.iter().min().copied().unwrap_or(75) as u64 { break; }
+            if summaries_inserted >= max_summaries { break; }
+            continue;
+        } else {
+            // If summarizer failed, drop the slice as a last resort to avoid infinite loop
+            let mut new_rest: Vec<ResponseItem> = Vec::with_capacity(rest.len() - (r.end - r.start));
+            new_rest.extend_from_slice(&rest[..r.start]);
+            new_rest.extend_from_slice(&rest[r.end..]);
+            rest = new_rest;
+            if injection_prefix.is_empty() { p.input = rest.clone(); } else { p.input = [injection_prefix.clone(), rest.clone()].concat(); }
+            formatted = p.get_formatted_input();
+            est = estimate_tokens_for_items(&formatted) as u64;
+            let used_pct = ((est as f64) / (effective_window as f64) * 100.0) as u64;
+            let target_tokens = (target_pct.min(99) as f64 / 100.0 * effective_window as f64) as u64;
+            if est <= target_tokens || used_pct < thresholds.iter().min().copied().unwrap_or(75) as u64 { break; }
+            continue;
+        }
+    }
+
+    std::borrow::Cow::Owned(p)
 }
 
 async fn run_compact_agent(
@@ -4754,6 +4918,11 @@ async fn drain_to_completed(sess: &Session, sub_id: &str, prompt: &Prompt) -> Co
                         ));
                     }
                 };
+                // Remember last completed token usage for baseline in post-prune updates
+                {
+                    let mut st = sess.state.lock().unwrap();
+                    st.last_completed_token_usage = Some(token_usage.clone());
+                }
                 sess.tx_event
                     .send(Event {
                         id: sub_id.to_string(),

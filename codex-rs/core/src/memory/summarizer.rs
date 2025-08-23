@@ -53,6 +53,11 @@ impl Summarizer for CompactSummarizer {
 
         // Collect compact lines: prefix with role and use textual content only.
         let mut lines: Vec<String> = Vec::new();
+        let mut file_anchors: Vec<String> = Vec::new();
+        let mut saw_tests_ok = false;
+        let mut saw_tests_failed = false;
+        let mut saw_build_failed = false;
+        let mut saw_error_line = false;
         for it in items {
             match it {
                 ResponseItem::Message { role, content, .. } => {
@@ -65,6 +70,9 @@ impl Summarizer for CompactSummarizer {
                                 if t.starts_with("[EPHEMERAL:") { continue; }
                                 if !text.is_empty() { text.push(' '); }
                                 text.push_str(t.trim());
+                                // harvest anchors and outcomes from message text
+                                harvest_file_anchors(t, &mut file_anchors);
+                                detect_outcomes(t, &mut saw_tests_ok, &mut saw_tests_failed, &mut saw_build_failed, &mut saw_error_line);
                             }
                             _ => {}
                         }
@@ -84,6 +92,9 @@ impl Summarizer for CompactSummarizer {
                 }
                 ResponseItem::FunctionCallOutput { output, .. } => {
                     let status = output.success.map(|b| if b { "ok" } else { "err" }).unwrap_or("n/a");
+                    // Harvest from full content before truncation
+                    harvest_file_anchors(&output.content, &mut file_anchors);
+                    detect_outcomes(&output.content, &mut saw_tests_ok, &mut saw_tests_failed, &mut saw_build_failed, &mut saw_error_line);
                     let mut excerpt: String = output.content.chars().take(60).collect();
                     if output.content.chars().count() > 60 { excerpt.push_str("…"); }
                     if excerpt.is_empty() { excerpt.push_str("<no output>"); }
@@ -92,6 +103,7 @@ impl Summarizer for CompactSummarizer {
                 ResponseItem::LocalShellCall { action, .. } => {
                     if let crate::models::LocalShellAction::Exec(exec) = action {
                         let mut cmd = exec.command.join(" ");
+                        harvest_file_anchors(&cmd, &mut file_anchors);
                         if cmd.chars().count() > 60 {
                             let truncated: String = cmd.chars().take(60).collect();
                             cmd = format!("{}…", truncated);
@@ -118,9 +130,37 @@ impl Summarizer for CompactSummarizer {
             title.truncate(80);
         }
 
-        // Body: bullets within budget.
+        // Body: bullets within budget. First add synthesized anchors/outcomes if available.
         let mut remaining = self.max_chars;
         let mut body = String::new();
+        if !file_anchors.is_empty() {
+            dedupe_keep_order(&mut file_anchors);
+            // keep top 3
+            let shown = file_anchors.into_iter().take(3).collect::<Vec<_>>().join(", ");
+            let bullet_full = format!("- Files: {}", shown);
+            if bullet_full.len() + 1 <= remaining {
+                body.push_str(&bullet_full);
+                body.push('\n');
+                remaining -= bullet_full.len() + 1;
+            }
+        }
+        if saw_build_failed || saw_tests_failed || saw_tests_ok || saw_error_line {
+            let result = if saw_build_failed {
+                "build failed"
+            } else if saw_tests_failed {
+                "tests failed"
+            } else if saw_tests_ok {
+                "tests passed"
+            } else {
+                "errors encountered"
+            };
+            let bullet_full = format!("- Result: {}", result);
+            if bullet_full.len() + 1 <= remaining {
+                body.push_str(&bullet_full);
+                body.push('\n');
+                remaining -= bullet_full.len() + 1;
+            }
+        }
         for line in lines {
             if remaining == 0 { break; }
             let bullet_full = format!("- {line}");
@@ -147,6 +187,79 @@ impl Summarizer for CompactSummarizer {
         }
 
         Some(Summary { title, text: body })
+    }
+}
+
+/// Deduplicate strings while preserving first-seen order.
+fn dedupe_keep_order(items: &mut Vec<String>) {
+    let mut seen = std::collections::HashSet::new();
+    items.retain(|s| seen.insert(s.clone()));
+}
+
+/// Harvest plausible file anchors from text using simple heuristics (no regex dependency).
+/// Extract tokens that look like relative paths and avoid URLs.
+fn harvest_file_anchors(text: &str, out: &mut Vec<String>) {
+    for raw in text.split(|c: char| c.is_whitespace() || c == ')' || c == '(' || c == '"' || c == '\'' || c == ',' ) {
+        let t = raw.trim_matches(|c: char| c == '.' || c == ';' || c == ':' );
+        if t.len() < 3 || t.len() > 200 { continue; }
+        if t.starts_with("http://") || t.starts_with("https://") { continue; }
+        if !t.contains('/') { continue; }
+        // must look like a file-ish path; allow alnum, _, -, ., / only
+        if !t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/') { continue; }
+        // avoid trailing diff markers
+        let candidate = t.trim_end_matches([':', ',', ';']).to_string();
+        // light heuristic: require a dot segment after a slash to suggest a filename
+        if candidate.rsplit('/').next().map(|s| s.contains('.')).unwrap_or(false) {
+            out.push(candidate);
+        }
+    }
+    // Also handle apply_patch diff header format from our patcher
+    if let Some(pos) = text.find("*** Update File: ") {
+        let after = &text[pos + 18..];
+        if let Some(end) = after.find('\n') {
+            let path = after[..end].trim();
+            if !path.is_empty() { out.push(path.to_string()); }
+        }
+    }
+}
+
+/// Detect test/build outcomes and generic error hints.
+fn detect_outcomes(text: &str, ok: &mut bool, fail: &mut bool, build_fail: &mut bool, err: &mut bool) {
+    let lower = text.to_lowercase();
+    if lower.contains("test result: ok") { *ok = true; }
+    if lower.contains("test result:") && (lower.contains("failed") || lower.contains("fail")) { *fail = true; }
+    if lower.contains("build failed") || lower.contains("compilation error") { *build_fail = true; }
+    if lower.contains("error:") { *err = true; }
+}
+
+#[cfg(test)]
+mod tests_extra {
+    use super::*;
+
+    fn msg(role: &str, text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: role.to_string(),
+            content: vec![crate::models::ContentItem::OutputText { text: text.to_string() }],
+        }
+    }
+
+    #[test]
+    fn includes_file_anchors_and_result() {
+        let s = CompactSummarizer::new(400);
+        let items = vec![
+            msg("user", "Working on src/main.rs and tui/app.rs"),
+            ResponseItem::FunctionCallOutput {
+                call_id: "1".into(),
+                output: crate::models::FunctionCallOutputPayload {
+                    content: "test result: ok\n*** Update File: core/lib.rs".into(),
+                    success: Some(true),
+                },
+            },
+        ];
+        let out = s.summarize(&items).expect("summary");
+        assert!(out.text.contains("Files:"), "expected files anchors: {}", out.text);
+        assert!(out.text.contains("Result: tests passed"), "expected result cue: {}", out.text);
     }
 }
 
