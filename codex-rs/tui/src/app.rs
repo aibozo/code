@@ -593,10 +593,12 @@ impl App<'_> {
                     match command {
                         SlashCommand::Reports => {
                             if let AppState::Chat { widget } = &mut self.app_state {
-                                if command_args.is_empty() {
-                                    widget.show_reports_picker();
-                                } else {
-                                    widget.show_reports_view_for(&command_args);
+                                let args = command_args.split_whitespace().collect::<Vec<_>>();
+                                match args.as_slice() {
+                                    [] => widget.show_reports_picker(),
+                                    [day] => widget.show_reports_run_picker(day),
+                                    [day, ts] => widget.show_report_view_for_day_and_ts(day, ts),
+                                    _ => widget.show_reports_picker(),
                                 }
                             }
                         }

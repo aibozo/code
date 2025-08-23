@@ -634,6 +634,122 @@ impl ChatWidget<'_> {
         }
         self.bottom_pane.show_reports_view(lines);
     }
+
+    /// Show a run picker for a specific day (YYYYMMDD) listing each run with a short summary.
+    pub(crate) fn show_reports_run_picker(&mut self, day: &str) {
+        use crate::bottom_pane::list_selection_view::{SelectionAction, SelectionItem};
+        use crate::app_event::AppEvent;
+        use crate::slash_command::SlashCommand;
+        let dir = self.config.cwd.join("harness").join("results").join(day);
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .ok()
+            .into_iter()
+            .flat_map(|it| it.filter_map(|e| e.ok()).map(|e| e.path()))
+            .filter(|p| p.is_file() && p.extension().map(|s| s == "json").unwrap_or(false))
+            .collect();
+        if files.is_empty() {
+            self.show_reports_view_for(day);
+            return;
+        }
+        files.sort();
+        let mut run_items: Vec<SelectionItem> = Vec::new();
+        let mut daily_ok = 0isize;
+        let mut daily_err = 0isize;
+        for p in files.iter().rev() {
+            let ts_name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+            let val: Option<serde_json::Value> = std::fs::read_to_string(p)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok());
+            let mut ok_cnt = 0isize;
+            let mut err_cnt = 0isize;
+            if let Some(obj) = val.as_ref() {
+                if let Some(stages) = obj.get("stages").and_then(|v| v.as_array()) {
+                    for st in stages {
+                        match st.get("status").and_then(|v| v.as_str()).unwrap_or("") {
+                            "ok" => ok_cnt += 1,
+                            "error" => err_cnt += 1,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            daily_ok += ok_cnt;
+            daily_err += err_cnt;
+            let desc = if ok_cnt + err_cnt > 0 {
+                format!("ok {} • error {}", ok_cnt, err_cnt)
+            } else {
+                "(no stages)".to_string()
+            };
+            let ts_for_action = ts_name.clone();
+            let day_for_action = day.to_string();
+            let action: SelectionAction = Box::new(move |tx| {
+                tx.send(AppEvent::DispatchCommand(
+                    SlashCommand::Reports,
+                    format!("/reports {} {}", day_for_action, ts_for_action),
+                ));
+            });
+            run_items.push(SelectionItem {
+                name: ts_name,
+                description: Some(desc),
+                is_current: false,
+                actions: vec![action],
+            });
+        }
+        let day_disp = if day.len() == 8 { format!("{}-{}-{}", &day[0..4], &day[4..6], &day[6..8]) } else { day.to_string() };
+        let subtitle = Some(format!("Runs: {}  •  Σ ok {}  error {}", run_items.len(), daily_ok.max(0), daily_err.max(0)));
+        self.bottom_pane.show_list_selection(
+            format!("Harness Reports • {}", day_disp),
+            subtitle,
+            Some("Enter: open run  •  Esc: back".to_string()),
+            run_items,
+        );
+    }
+
+    /// Show a specific run report for a day and timestamp (YYYYMMDD and YYYYMMDD-HHMMSS).
+    pub(crate) fn show_report_view_for_day_and_ts(&mut self, day: &str, ts: &str) {
+        use ratatui::text::{Line, Span};
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let path = self
+            .config
+            .cwd
+            .join("harness")
+            .join("results")
+            .join(day)
+            .join(format!("{}.json", ts));
+        if let Ok(s) = std::fs::read_to_string(&path) {
+            if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&s) {
+                let ts_disp = obj
+                    .get("timestamp")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(ts);
+                let day_disp = if day.len() == 8 { format!("{}-{}-{}", &day[0..4], &day[4..6], &day[6..8]) } else { day.to_string() };
+                lines.push(Line::from(vec![Span::raw("Harness Report • "), Span::raw(day_disp), Span::raw(" • "), Span::raw(ts_disp.to_string())]));
+                lines.push(Line::from(""));
+                if let Some(stages) = obj.get("stages").and_then(|v| v.as_array()) {
+                    for st in stages {
+                        let name = st.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                        let status = st.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                        lines.push(Line::from(format!("{name}: {status}")));
+                        if let Some(metrics) = st.get("metrics").and_then(|v| v.as_object()) {
+                            for (k, v) in metrics {
+                                let val = if v.is_string() || v.is_number() || v.is_boolean() {
+                                    v.to_string()
+                                } else {
+                                    match serde_json::to_string(v) { Ok(s) => s, Err(_) => "{}".to_string() }
+                                };
+                                lines.push(Line::from(format!("  - {k}: {val}")));
+                            }
+                        }
+                    }
+                }
+            } else {
+                lines.push(Line::from("Invalid report JSON."));
+            }
+        } else {
+            lines.push(Line::from("Report not found."));
+        }
+        self.bottom_pane.show_reports_view(lines);
+    }
     fn perf_label_for_item(&self, item: &dyn HistoryCell) -> String {
         use crate::history_cell::{ExecKind, ExecStatus, HistoryCellType, PatchKind, ToolStatus};
         match item.kind() {
