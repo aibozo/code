@@ -241,29 +241,41 @@ impl App<'_> {
                     });
                     append_policy_log(&log_path, event);
                 }
-            }
 
-            // Show harness results (latest + delta) if present
+            // Show harness results (latest across dated dirs + delta) if present
             {
                 use ratatui::text::{Line, Span};
                 let harness_dir = config.cwd.join("harness").join("results");
+                // Collect JSON files from top-level and 1st-level date dirs
+                let mut files: Vec<std::path::PathBuf> = Vec::new();
                 if let Ok(entries) = std::fs::read_dir(&harness_dir) {
-                    let mut files: Vec<_> = entries
-                        .filter_map(|e| e.ok())
-                        .filter(|e| e.path().extension().map(|s| s == "json").unwrap_or(false))
-                        .collect();
-                    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
-                    if let Some(last) = files.last() {
-                        let last_path = last.path();
-                        let last_val: Option<serde_json::Value> = std::fs::read_to_string(&last_path)
-                            .ok()
-                            .and_then(|s| serde_json::from_str(&s).ok());
-                        let prev_val: Option<serde_json::Value> = files
-                            .iter()
-                            .rev()
-                            .nth(1)
-                            .and_then(|e| std::fs::read_to_string(e.path()).ok())
-                            .and_then(|s| serde_json::from_str(&s).ok());
+                    for e in entries.flatten() {
+                        let p = e.path();
+                        if p.is_file() && p.extension().map(|s| s == "json").unwrap_or(false) {
+                            files.push(p);
+                        } else if p.is_dir() {
+                            if let Ok(day_entries) = std::fs::read_dir(&p) {
+                                for de in day_entries.flatten() {
+                                    let dp = de.path();
+                                    if dp.is_file() && dp.extension().map(|s| s == "json").unwrap_or(false) {
+                                        files.push(dp);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                files.sort();
+                if let Some(last_path) = files.last() {
+                    let last_val: Option<serde_json::Value> = std::fs::read_to_string(last_path)
+                        .ok()
+                        .and_then(|s| serde_json::from_str(&s).ok());
+                    let prev_val: Option<serde_json::Value> = files
+                        .iter()
+                        .rev()
+                        .nth(1)
+                        .and_then(|p| std::fs::read_to_string(p).ok())
+                        .and_then(|s| serde_json::from_str(&s).ok());
                         if let Some(last_json) = last_val {
                             let mut lines: Vec<Line<'static>> = Vec::new();
                             let ts = last_json.get("timestamp").and_then(|v| v.as_str()).unwrap_or("unknown");
@@ -581,7 +593,11 @@ impl App<'_> {
                     match command {
                         SlashCommand::Reports => {
                             if let AppState::Chat { widget } = &mut self.app_state {
-                                widget.show_reports_view();
+                                if command_args.is_empty() {
+                                    widget.show_reports_picker();
+                                } else {
+                                    widget.show_reports_view_for(&command_args);
+                                }
                             }
                         }
                         SlashCommand::New => {

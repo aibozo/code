@@ -17,8 +17,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 ts=$(date +%Y%m%d-%H%M%S)
+day=$(date +%Y%m%d)
 log_file="$ART_DIR/$ts.log"
-out_json="$OUT_DIR/$ts.json"
+day_dir="$OUT_DIR/$day"
+mkdir -p "$day_dir"
+out_json="$day_dir/$ts.json"
 
 echo "[harness] Starting harness run at $ts (seed=$SEED)" | tee "$log_file"
 

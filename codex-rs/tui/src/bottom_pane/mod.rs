@@ -398,6 +398,14 @@ impl BottomPane<'_> {
         self.request_redraw();
     }
 
+    /// Show a generic list selection popup with items and actions.
+    pub fn show_list_selection(&mut self, title: String, subtitle: Option<String>, footer: Option<String>, items: Vec<list_selection_view::SelectionItem>) {
+        let view = list_selection_view::ListSelectionView::new(title, subtitle, footer, items, self.app_event_tx.clone());
+        self.active_view = Some(Box::new(view));
+        self.status_view_active = false;
+        self.request_redraw();
+    }
+
     /// Height (terminal rows) required by the current bottom pane.
     pub(crate) fn request_redraw(&self) {
         self.app_event_tx.send(AppEvent::RequestRedraw)

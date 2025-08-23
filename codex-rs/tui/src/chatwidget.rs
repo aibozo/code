@@ -507,6 +507,133 @@ impl ChatWidget<'_> {
         }
         self.bottom_pane.show_reports_view(lines);
     }
+
+    /// Show a picker of available report date directories (YYYYMMDD).
+    pub(crate) fn show_reports_picker(&mut self) {
+        use crate::bottom_pane::list_selection_view::{SelectionAction, SelectionItem};
+        use crate::app_event::AppEvent;
+        use crate::slash_command::SlashCommand;
+        let results_dir = self.config.cwd.join("harness").join("results");
+        let mut dates: Vec<String> = std::fs::read_dir(&results_dir)
+            .ok()
+            .into_iter()
+            .flat_map(|it| it.filter_map(|e| e.ok()))
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|name| name.len() == 8 && name.chars().all(|c| c.is_ascii_digit()))
+            .collect();
+        dates.sort();
+        if dates.is_empty() {
+            // No date dirs yet; fall back to showing latest across all
+            self.show_reports_view();
+            return;
+        }
+        let items: Vec<SelectionItem> = dates
+            .into_iter()
+            .rev()
+            .map(|day| {
+                let day_disp = format!("{}-{}-{}", &day[0..4], &day[4..6], &day[6..8]);
+                let act_day = day.clone();
+                let action: SelectionAction = Box::new(move |tx| {
+                    // Re-dispatch /reports with the selected date argument
+                    tx.send(AppEvent::DispatchCommand(SlashCommand::Reports, format!("/reports {}", act_day)));
+                });
+                SelectionItem {
+                    name: day_disp,
+                    description: Some("Select to view latest run for this date".to_string()),
+                    is_current: false,
+                    actions: vec![action],
+                }
+            })
+            .collect();
+        self.bottom_pane.show_list_selection(
+            "Harness Reports".to_string(),
+            Some("Choose a date".to_string()),
+            Some("Enter: open  •  Esc: close".to_string()),
+            items,
+        );
+    }
+
+    /// Show reports view for a specific YYYYMMDD date directory.
+    pub(crate) fn show_reports_view_for(&mut self, day: &str) {
+        use ratatui::text::{Line, Span};
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let dir = self.config.cwd.join("harness").join("results").join(day);
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .ok()
+            .into_iter()
+            .flat_map(|it| it.filter_map(|e| e.ok()).map(|e| e.path()))
+            .filter(|p| p.extension().map(|s| s == "json").unwrap_or(false))
+            .collect();
+        files.sort();
+        if let Some(last) = files.last() {
+            let last_json: Option<serde_json::Value> = std::fs::read_to_string(last)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok());
+            if let Some(obj) = last_json {
+                let ts = obj.get("timestamp").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let day_disp = if day.len() == 8 { format!("{}-{}-{}", &day[0..4], &day[4..6], &day[6..8]) } else { day.to_string() };
+                lines.push(Line::from(vec![Span::raw("Harness Report • "), Span::raw(day_disp), Span::raw(" • "), Span::raw(ts.to_string())]));
+                lines.push(Line::from(""));
+                if let Some(stages) = obj.get("stages").and_then(|v| v.as_array()) {
+                    for st in stages {
+                        let name = st.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                        let status = st.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                        lines.push(Line::from(format!("{name}: {status}")));
+                        if let Some(metrics) = st.get("metrics").and_then(|v| v.as_object()) {
+                            for (k, v) in metrics {
+                                let val = if v.is_string() || v.is_number() || v.is_boolean() {
+                                    v.to_string()
+                                } else {
+                                    match serde_json::to_string(v) { Ok(s) => s, Err(_) => "{}".to_string() }
+                                };
+                                lines.push(Line::from(format!("  - {k}: {val}")));
+                            }
+                        }
+                    }
+                }
+                if files.len() >= 2 {
+                    let prev = &files[files.len() - 2];
+                    let prev_json: Option<serde_json::Value> = std::fs::read_to_string(prev)
+                        .ok()
+                        .and_then(|s| serde_json::from_str(&s).ok());
+                    if let Some(prev_obj) = prev_json {
+                        let mut ok_now = 0isize;
+                        let mut err_now = 0isize;
+                        let mut ok_prev = 0isize;
+                        let mut err_prev = 0isize;
+                        if let Some(stages) = obj.get("stages").and_then(|v| v.as_array()) {
+                            for st in stages {
+                                match st.get("status").and_then(|v| v.as_str()).unwrap_or("") {
+                                    "ok" => ok_now += 1,
+                                    "error" => err_now += 1,
+                                    _ => {}
+                                }
+                            }
+                        }
+                        if let Some(stages) = prev_obj.get("stages").and_then(|v| v.as_array()) {
+                            for st in stages {
+                                match st.get("status").and_then(|v| v.as_str()).unwrap_or("") {
+                                    "ok" => ok_prev += 1,
+                                    "error" => err_prev += 1,
+                                    _ => {}
+                                }
+                            }
+                        }
+                        let d_ok = ok_now - ok_prev;
+                        let d_err = err_now - err_prev;
+                        lines.push(Line::from(""));
+                        lines.push(Line::from(format!("Δ vs previous • ok: {:+}, error: {:+}", d_ok, d_err)));
+                    }
+                }
+            } else {
+                lines.push(Line::from("No parsable harness results found."));
+            }
+        } else {
+            lines.push(Line::from("No reports found for selected date."));
+        }
+        self.bottom_pane.show_reports_view(lines);
+    }
     fn perf_label_for_item(&self, item: &dyn HistoryCell) -> String {
         use crate::history_cell::{ExecKind, ExecStatus, HistoryCellType, PatchKind, ToolStatus};
         match item.kind() {
