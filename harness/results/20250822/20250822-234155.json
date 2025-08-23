@@ -1,0 +1,11 @@
+{
+  "version": "v1",
+  "timestamp": "20250822-234155",
+  "seed": 3,
+  "stages": [[harness] stage=unit cmd=/home/kil/dev/code/harness/stages/unit.sh --seed 3
+{"name":"unit","status":"ok","metrics":{"tests_run":0,"tests_passed":0}},[harness] stage=integration cmd=/home/kil/dev/code/harness/stages/integration.sh --seed 3
+{"name":"integration","status":"ok","metrics":{"tests_run":0,"tests_passed":0}},[harness] stage=property cmd=/home/kil/dev/code/harness/stages/property.sh --seed 3
+{"name":"property","status":"ok","metrics":{"cases_run":0,"cases_passed":0}},[harness] stage=security cmd=/home/kil/dev/code/harness/stages/security.sh --seed 3
+{"name":"security","status":"ok","metrics":{"issues":[]}},[harness] stage=style cmd=/home/kil/dev/code/harness/stages/style.sh --seed 3
+{"name":"style","status":"ok","metrics":{"issues":[]}},{"name":"swebench","status":"ok","metrics":{"timestamp": "20250822-234155", "instances": 0, "resolved": 0, "score": 0}}]
+}

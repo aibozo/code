@@ -1,0 +1,6 @@
+{
+  "version": "v1",
+  "timestamp": "20250822-234243",
+  "seed": 4,
+  "stages": [{"name":"unit","status":"ok","metrics":{"tests_run":0,"tests_passed":0}},{"name":"integration","status":"ok","metrics":{"tests_run":0,"tests_passed":0}},{"name":"property","status":"ok","metrics":{"cases_run":0,"cases_passed":0}},{"name":"security","status":"ok","metrics":{"issues":[]}},{"name":"style","status":"ok","metrics":{"issues":[]}},{"name":"swebench","status":"ok","metrics":{"timestamp": "20250822-234243", "instances": 0, "resolved": 0, "score": 0}}]
+}

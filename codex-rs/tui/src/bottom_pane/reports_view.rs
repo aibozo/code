@@ -5,15 +5,26 @@ use ratatui::text::Line;
 
 use super::bottom_pane_view::{BottomPaneView, ConditionalUpdate};
 use super::BottomPane;
+use crate::app_event::AppEvent;
+use crate::app_event_sender::AppEventSender;
+use crate::slash_command::SlashCommand;
+
+pub(crate) struct ReportsNav {
+    pub day: String,
+    pub runs: Vec<String>,
+    pub index: usize,
+}
 
 pub(crate) struct ReportsView {
     lines: Vec<Line<'static>>,
     scroll: u16,
+    app_event_tx: AppEventSender,
+    nav: Option<ReportsNav>,
 }
 
 impl ReportsView {
-    pub fn new(lines: Vec<Line<'static>>) -> Self {
-        Self { lines, scroll: 0 }
+    pub fn new(lines: Vec<Line<'static>>, app_event_tx: AppEventSender, nav: Option<ReportsNav>) -> Self {
+        Self { lines, scroll: 0, app_event_tx, nav }
     }
 }
 
@@ -57,6 +68,32 @@ impl BottomPaneView<'_> for ReportsView {
             KeyCode::PageDown => {
                 self.scroll = self.scroll.saturating_add(5);
             }
+            KeyCode::Left => {
+                if let Some(nav) = &mut self.nav {
+                    if nav.index > 0 {
+                        nav.index -= 1;
+                        if let Some(ts) = nav.runs.get(nav.index) {
+                            self.app_event_tx.send(AppEvent::DispatchCommand(
+                                SlashCommand::Reports,
+                                format!("/reports {} {}", nav.day, ts),
+                            ));
+                        }
+                    }
+                }
+            }
+            KeyCode::Right => {
+                if let Some(nav) = &mut self.nav {
+                    if nav.index + 1 < nav.runs.len() {
+                        nav.index += 1;
+                        if let Some(ts) = nav.runs.get(nav.index) {
+                            self.app_event_tx.send(AppEvent::DispatchCommand(
+                                SlashCommand::Reports,
+                                format!("/reports {} {}", nav.day, ts),
+                            ));
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -65,4 +102,3 @@ impl BottomPaneView<'_> for ReportsView {
         ConditionalUpdate::NoRedraw
     }
 }
-

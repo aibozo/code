@@ -597,6 +597,7 @@ impl App<'_> {
                                 match args.as_slice() {
                                     [] => widget.show_reports_picker(),
                                     [day] => widget.show_reports_run_picker(day),
+                                    [day, second] if *second == "summary" => widget.show_daily_summary_for(day),
                                     [day, ts] => widget.show_report_view_for_day_and_ts(day, ts),
                                     _ => widget.show_reports_picker(),
                                 }

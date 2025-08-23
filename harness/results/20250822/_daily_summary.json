@@ -1,0 +1,14 @@
+{
+  "runs_count": 1,
+  "total_ok": 6,
+  "total_error": 0,
+  "improved_runs": 0,
+  "runs": [
+    {
+      "ts": "20250822-234243",
+      "ok": 6,
+      "error": 0
+    }
+  ],
+  "updated_at": "20250822-234243"
+}

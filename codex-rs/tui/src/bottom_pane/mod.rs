@@ -28,7 +28,7 @@ pub mod list_selection_view;
 mod textarea;
 mod theme_selection_view;
 mod verbosity_selection_view;
-mod reports_view;
+pub mod reports_view;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CancellationEvent {
@@ -391,8 +391,8 @@ impl BottomPane<'_> {
     }
 
     /// Show harness reports viewer
-    pub fn show_reports_view(&mut self, lines: Vec<ratatui::text::Line<'static>>) {
-        let view = reports_view::ReportsView::new(lines);
+    pub fn show_reports_view(&mut self, lines: Vec<ratatui::text::Line<'static>>, nav: Option<reports_view::ReportsNav>) {
+        let view = reports_view::ReportsView::new(lines, self.app_event_tx.clone(), nav);
         self.active_view = Some(Box::new(view));
         self.status_view_active = false;
         self.request_redraw();

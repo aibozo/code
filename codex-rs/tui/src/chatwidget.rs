@@ -505,7 +505,7 @@ impl ChatWidget<'_> {
         } else {
             lines.push(Line::from("No harness results yet. Run: code harness run"));
         }
-        self.bottom_pane.show_reports_view(lines);
+        self.bottom_pane.show_reports_view(lines, None);
     }
 
     /// Show a picker of available report date directories (YYYYMMDD).
@@ -632,7 +632,15 @@ impl ChatWidget<'_> {
         } else {
             lines.push(Line::from("No reports found for selected date."));
         }
-        self.bottom_pane.show_reports_view(lines);
+        // Build nav metadata: all runs (timestamps) and current index
+        let runs: Vec<String> = files
+            .iter()
+            .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()))
+            .collect();
+        let nav = if !runs.is_empty() {
+            Some(crate::bottom_pane::reports_view::ReportsNav { day: day.to_string(), runs: runs.clone(), index: runs.len().saturating_sub(1) })
+        } else { None };
+        self.bottom_pane.show_reports_view(lines, nav);
     }
 
     /// Show a run picker for a specific day (YYYYMMDD) listing each run with a short summary.
@@ -697,11 +705,30 @@ impl ChatWidget<'_> {
         }
         let day_disp = if day.len() == 8 { format!("{}-{}-{}", &day[0..4], &day[4..6], &day[6..8]) } else { day.to_string() };
         let subtitle = Some(format!("Runs: {}  •  Σ ok {}  error {}", run_items.len(), daily_ok.max(0), daily_err.max(0)));
+        // Build list items, with a top-level Daily Summary entry
+        let mut items_with_summary: Vec<SelectionItem> = Vec::new();
+        {
+            let day_for_action = day.to_string();
+            let action: SelectionAction = Box::new(move |tx| {
+                tx.send(AppEvent::DispatchCommand(
+                    SlashCommand::Reports,
+                    format!("/reports {} summary", day_for_action),
+                ));
+            });
+            items_with_summary.push(SelectionItem {
+                name: "Daily Summary".to_string(),
+                description: Some("Aggregated results and deltas".to_string()),
+                is_current: false,
+                actions: vec![action],
+            });
+        }
+        items_with_summary.extend(run_items.into_iter());
+
         self.bottom_pane.show_list_selection(
             format!("Harness Reports • {}", day_disp),
             subtitle,
             Some("Enter: open run  •  Esc: back".to_string()),
-            run_items,
+            items_with_summary,
         );
     }
 
@@ -748,7 +775,54 @@ impl ChatWidget<'_> {
         } else {
             lines.push(Line::from("Report not found."));
         }
-        self.bottom_pane.show_reports_view(lines);
+        // Build nav for this specific ts
+        let runs: Vec<String> = std::fs::read_dir(self.config.cwd.join("harness").join("results").join(day))
+            .ok()
+            .into_iter()
+            .flat_map(|it| it.filter_map(|e| e.ok()).map(|e| e.path()))
+            .filter(|p| p.is_file() && p.extension().map(|s| s == "json").unwrap_or(false))
+            .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()))
+            .collect();
+        let index = runs.iter().position(|s| s == ts).unwrap_or(0);
+        let nav = Some(crate::bottom_pane::reports_view::ReportsNav { day: day.to_string(), runs, index });
+        self.bottom_pane.show_reports_view(lines, nav);
+    }
+
+    /// Show a daily summary for a given day (aggregated across runs)
+    pub(crate) fn show_daily_summary_for(&mut self, day: &str) {
+        use ratatui::text::{Line, Span};
+        let dir = self.config.cwd.join("harness").join("results").join(day);
+        let sum_path = dir.join("_daily_summary.json");
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let day_disp = if day.len() == 8 { format!("{}-{}-{}", &day[0..4], &day[4..6], &day[6..8]) } else { day.to_string() };
+        lines.push(Line::from(vec![Span::raw("Daily Summary • "), Span::raw(day_disp)]));
+        lines.push(Line::from(""));
+        let mut used_summary = false;
+        if let Ok(s) = std::fs::read_to_string(&sum_path) {
+            if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&s) {
+                used_summary = true;
+                let runs_count = obj.get("runs_count").and_then(|v| v.as_i64()).unwrap_or(0);
+                let total_ok = obj.get("total_ok").and_then(|v| v.as_i64()).unwrap_or(0);
+                let total_err = obj.get("total_error").and_then(|v| v.as_i64()).unwrap_or(0);
+                let improved = obj.get("improved_runs").and_then(|v| v.as_i64()).unwrap_or(0);
+                lines.push(Line::from(format!("Runs: {}", runs_count)));
+                lines.push(Line::from(format!("Σ ok: {}  •  Σ error: {}", total_ok, total_err)));
+                lines.push(Line::from(format!("Improved vs prior: {}", improved)));
+                lines.push(Line::from(""));
+                if let Some(runs) = obj.get("runs").and_then(|v| v.as_array()) {
+                    for r in runs.iter().rev() {
+                        let ts = r.get("ts").and_then(|v| v.as_str()).unwrap_or("?");
+                        let ok = r.get("ok").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let err = r.get("error").and_then(|v| v.as_i64()).unwrap_or(0);
+                        lines.push(Line::from(format!("{ts}: ok {ok} • error {err}")));
+                    }
+                }
+            }
+        }
+        if !used_summary {
+            lines.push(Line::from("No daily summary available."));
+        }
+        self.bottom_pane.show_reports_view(lines, None);
     }
     fn perf_label_for_item(&self, item: &dyn HistoryCell) -> String {
         use crate::history_cell::{ExecKind, ExecStatus, HistoryCellType, PatchKind, ToolStatus};
