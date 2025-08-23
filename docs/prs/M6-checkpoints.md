@@ -1,12 +1,24 @@
 # PR: M6 — Checkpoints & self-restart
 
 Summary:
-Add design for saving/restoring checkpoints of prompts, skills, memory
-snapshots, configs, and harness metrics.
+Persist accepted iterations as checkpoints and allow relaunching from them in a fresh sandbox.
 
-Changes included:
-- Docs and script placeholders (to be added under `scripts/`).
+Artifacts to save:
+- `prompts/`, `skills/` (agent policies, tools)
+- `configs/` (policy, memory)
+- Memory snapshots: pg dump + Neo4j export (when enabled)
+- Harness metrics (latest JSON + history)
+- Git ref and diff from previous checkpoint
+
+Scripts:
+1) `scripts/checkpoint.sh [--note <text>]`
+   - Create `/state/checkpoints/<ts>/`
+   - Capture git status, diffs, and copy artifacts
+   - Write `manifest.json` with paths and notes
+2) `scripts/relaunch.sh [<id>|latest]`
+   - Restore artifacts into a fresh workspace clone
+   - Launch in selected sandbox profile
 
 Acceptance criteria:
-- Design reviewed; minimal scripts in follow-up.
-
+- Script specs and manifest format are documented
+- Path layout and retention policy (keep last N=10) defined

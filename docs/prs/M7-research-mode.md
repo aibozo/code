@@ -1,12 +1,16 @@
 # PR: M7 — Research mode (optional)
 
 Summary:
-Enable a research mode that leverages the internal browser and MCP tools for
-literature/tooling review to inform self-improvement plans.
+Allow the agent to perform scoped browsing and MCP-powered queries to gather context for planning. Emphasize reproducibility and citations.
 
-Changes included:
-- Docs only; integration points identified.
+Modes:
+- Offline (default): no network; uses local docs/cache
+- Online (explicit): network allowlist; all fetches logged and cached
+
+Integration:
+- Planner includes a `sources` section citing URLs + snippets
+- Cached content stored under `artifacts/research/<ts>/`; re-used across attempts
 
 Acceptance criteria:
-- Design reviewed; gated behind explicit flags.
-
+- Clear flag to enable online mode; default remains offline
+- Citation format and caching strategy documented
