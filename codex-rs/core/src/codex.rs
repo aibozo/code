@@ -297,7 +297,7 @@ use crate::openai_tools::get_openai_tools;
 use crate::parse_command::parse_command;
 use crate::plan_tool::handle_update_plan;
 use crate::project_doc::get_user_instructions;
-use crate::memory::summarizer::{Summarizer, CompactSummarizer};
+use crate::memory::summarizer::Summarizer;
 use crate::conversation_history::volley::{segment_into_volleys, filter_compaction_candidates};
 use crate::protocol::AgentMessageDeltaEvent;
 use crate::protocol::AgentMessageEvent;
@@ -444,6 +444,11 @@ struct State {
     history: ConversationHistory,
     /// Last completed turn's provider-reported token usage (for baselining post-prune updates)
     last_completed_token_usage: Option<crate::protocol::TokenUsage>,
+    /// Adaptive scale factor to make local token estimates closer to provider-reported usage.
+    /// When `None`, a neutral scale of 1.0 is used.
+    token_estimate_scale: Option<f64>,
+    /// Number of observations incorporated into `token_estimate_scale`.
+    token_estimate_observations: u32,
     /// Tracks which completed agents (by id) have already been returned to the
     /// model for a given batch when using `agent_wait` without `return_all`.
     /// This enables sequential waiting behavior across multiple calls.
@@ -1838,26 +1843,25 @@ async fn run_agent(sess: Arc<Session>, sub_id: String, input: Vec<InputItem>) {
 
             let repo_key = crate::util::repo_key(&sess.cwd);
             let store = crate::memory::store_jsonl::JsonlMemoryStore::new(sess.client.get_codex_home());
-            // Prefer LLM-backed summarizer when configured and API key is available.
+            // Prefer LLM-backed summarizer when configured; do not fall back to local summarizer.
             let summary_max = mem_cfg.summary_max_chars.max(50);
             let mut summarizer_box: Box<dyn crate::memory::summarizer::Summarizer> = {
-                if mem_cfg.use_llm_summarizer && has_openai_api_key(sess.client.get_codex_home()) {
+                if mem_cfg.use_llm_summarizer {
                     if let Some(p) = built_in_model_providers().get("openai").cloned() {
-                        if let Ok(s) = crate::memory::summarizer::OpenAiNanoSummarizer::from_provider(
+                        match crate::memory::summarizer::OpenAiNanoSummarizer::from_provider(
                             &p,
                             sess.client.get_codex_home(),
                             &mem_cfg.summarizer_model,
                             summary_max,
                         ) {
-                            Box::new(s)
-                        } else {
-                            Box::new(crate::memory::summarizer::CompactSummarizer::new(summary_max))
+                            Ok(s) => Box::new(s),
+                            Err(_) => Box::new(crate::memory::summarizer::NoopSummarizer),
                         }
                     } else {
-                        Box::new(crate::memory::summarizer::CompactSummarizer::new(summary_max))
+                        Box::new(crate::memory::summarizer::NoopSummarizer)
                     }
                 } else {
-                    Box::new(crate::memory::summarizer::CompactSummarizer::new(summary_max))
+                    Box::new(crate::memory::summarizer::NoopSummarizer)
                 }
             };
             let pruner = crate::conversation_history::prune::ConversationHistoryPruner::new(
@@ -1881,7 +1885,7 @@ async fn run_agent(sess: Arc<Session>, sub_id: String, input: Vec<InputItem>) {
                     .and_then(|u| u.cached_input_tokens)
                     .unwrap_or(0);
                 let remaining_items = state.history.contents();
-                let est_tokens = estimate_tokens_for_items(&remaining_items) as u64;
+                let est_tokens = estimate_tokens_for_items_scaled(sess.as_ref(), &remaining_items) as u64;
                 let post_prune = crate::protocol::TokenUsage {
                     // Treat total as baseline + estimated remaining to make
                     // tokens_in_context_window() - baseline ~= est_tokens.
@@ -2571,6 +2575,34 @@ fn estimate_tokens_for_items(items: &[ResponseItem]) -> usize {
     (chars + 3) / 4
 }
 
+/// Like `estimate_tokens_for_items` but applies a per‑session adaptive scale so the
+/// estimate tracks provider-reported usage more closely.
+fn estimate_tokens_for_items_scaled(sess: &Session, items: &[ResponseItem]) -> usize {
+    let base = estimate_tokens_for_items(items) as f64;
+    let scale = {
+        let st = sess.state.lock().unwrap();
+        st.token_estimate_scale.unwrap_or(1.0)
+    };
+    ((base * scale).ceil()) as usize
+}
+
+/// Update the adaptive token estimation scale using the provider-reported token usage
+/// for the just-completed request and our base estimate (pre-scale) of that request.
+fn update_token_estimate_scale_after_completed(sess: &Session, provider_usage: &crate::protocol::TokenUsage, base_estimated_input_tokens: u64) {
+    if base_estimated_input_tokens == 0 { return; }
+    let non_cached = provider_usage.non_cached_input();
+    if non_cached == 0 { return; }
+    let ratio = (non_cached as f64) / (base_estimated_input_tokens as f64);
+    // Clamp to avoid wild swings on noisy single turns
+    let ratio = ratio.clamp(0.5, 2.0);
+    let mut st = sess.state.lock().unwrap();
+    let prev = st.token_estimate_scale.unwrap_or(1.0);
+    // Exponential moving average: favor stability while still adapting.
+    let new = 0.7 * prev + 0.3 * ratio;
+    st.token_estimate_scale = Some(new);
+    st.token_estimate_observations = st.token_estimate_observations.saturating_add(1);
+}
+
 /// Compute a conservative character budget for memory injection based on the model's
 /// context window, estimated size of the current turn input, and a fixed safety margin.
 fn compute_injection_char_budget(sess: &Session, turn_input: &Vec<ResponseItem>) -> usize {
@@ -2582,7 +2614,7 @@ fn compute_injection_char_budget(sess: &Session, turn_input: &Vec<ResponseItem>)
         .client
         .get_model_max_output_tokens()
         .unwrap_or(1_024);
-    let input_tokens = estimate_tokens_for_items(turn_input) as u64;
+    let input_tokens = estimate_tokens_for_items_scaled(sess, turn_input) as u64;
     // Reserve a safety margin for instructions/tools/etc.
     let safety_margin_tokens: u64 = 2_000;
     // Also cap memory injection to at most 10% of the context window
@@ -3058,6 +3090,13 @@ async fn try_run_turn(
         std::borrow::Cow::Owned(p2) => Cow::Owned(p2),
     };
 
+    // Compute a base (unscaled) estimate for this turn's input so we can calibrate using
+    // provider-reported usage when the turn completes.
+    let base_est_for_turn: u64 = {
+        let items = prompt.get_formatted_input();
+        estimate_tokens_for_items(&items) as u64
+    };
+
     let mut stream = sess.client.clone().stream(&prompt).await?;
 
     let mut output = Vec::new();
@@ -3097,6 +3136,8 @@ async fn try_run_turn(
                 token_usage,
             } => {
                 if let Some(token_usage) = token_usage {
+                    // Adapt token estimation scale for future turns
+                    update_token_estimate_scale_after_completed(sess, &token_usage, base_est_for_turn);
                     // Remember last completed token usage for baseline in post-prune updates
                     {
                         let mut st = sess.state.lock().unwrap();
@@ -3182,7 +3223,7 @@ fn preflight_compact_if_needed<'a>(sess: &Session, prompt: &'a Prompt) -> std::b
 
     // Fast path – already fits
     let mut formatted = prompt.get_formatted_input();
-    let mut est = estimate_tokens_for_items(&formatted) as u64;
+    let mut est = estimate_tokens_for_items_scaled(sess, &formatted) as u64;
     let mem_cfg = sess.client.get_memory_config();
     let thresholds = if mem_cfg.compact_threshold_pct.is_empty() { vec![75,85,95] } else { mem_cfg.compact_threshold_pct.clone() };
     let target_pct: u64 = mem_cfg.compact_target_pct as u64;
@@ -3222,6 +3263,12 @@ fn preflight_compact_if_needed<'a>(sess: &Session, prompt: &'a Prompt) -> std::b
             .into_iter()
             .filter(|r| r.start < protect_start_item_idx)
             .collect::<Vec<_>>();
+        // Prefer summarizing low‑salience volleys first to preserve important context.
+        cands.sort_by(|a, b| {
+            let sa = volley_salience(&rest, a);
+            let sb = volley_salience(&rest, b);
+            sa.cmp(&sb).then_with(|| a.start.cmp(&b.start))
+        });
 
         if cands.is_empty() {
             // Reduce protection first, then shrink summary, then drop injection
@@ -3233,7 +3280,7 @@ fn preflight_compact_if_needed<'a>(sess: &Session, prompt: &'a Prompt) -> std::b
                 // Rebuild p.input to reflect injection removal
                 p.input = rest.clone();
                 formatted = p.get_formatted_input();
-                est = estimate_tokens_for_items(&formatted) as u64;
+                est = estimate_tokens_for_items_scaled(sess, &formatted) as u64;
                 if est <= hard_limit { break; }
                 continue;
             }
@@ -3243,8 +3290,30 @@ fn preflight_compact_if_needed<'a>(sess: &Session, prompt: &'a Prompt) -> std::b
         // Summarize the oldest candidate volley
         let r = cands.remove(0);
         let slice = &rest[r.start..r.end];
-        let summarizer = CompactSummarizer::new(summary_max_chars);
-        if let Some(summary) = summarizer.summarize(slice) {
+        // Allocate a slightly larger budget to information‑dense volleys so their summaries keep more detail.
+        let sal = volley_salience(&rest, &r);
+        let per_volley_budget = {
+            let boost = (sal as usize) * 50; // +50 chars per salience point
+            let max_boost = summary_max_chars; // cap at 2x base budget
+            summary_max_chars.saturating_add(boost.min(max_boost)).max(200)
+        };
+        // Summarize this volley using the LLM summarizer when available.
+        let maybe_summary = (|| {
+            if !mem_cfg.use_llm_summarizer { return None; }
+            if let Some(p) = built_in_model_providers().get("openai").cloned() {
+                if let Ok(s) = crate::memory::summarizer::OpenAiNanoSummarizer::from_provider(
+                    &p,
+                    sess.client.get_codex_home(),
+                    &mem_cfg.summarizer_model,
+                    per_volley_budget,
+                ) {
+                    return s.summarize(slice);
+                }
+            }
+            None
+        })();
+
+        if let Some(summary) = maybe_summary {
             let header = format!("[memory:context v1 | repo={repo_key}]");
             let text = format!("{header}\n{}\n{}", summary.title, summary.text);
             let summary_item = ResponseItem::Message {
@@ -3264,7 +3333,7 @@ fn preflight_compact_if_needed<'a>(sess: &Session, prompt: &'a Prompt) -> std::b
 
             // Re‑estimate
             formatted = p.get_formatted_input();
-            est = estimate_tokens_for_items(&formatted) as u64;
+            est = estimate_tokens_for_items_scaled(sess, &formatted) as u64;
             summaries_inserted = summaries_inserted.saturating_add(1);
             let used_pct = ((est as f64) / (effective_window as f64) * 100.0) as u64;
             let target_tokens = (target_pct.min(99) as f64 / 100.0 * effective_window as f64) as u64;
@@ -3272,14 +3341,23 @@ fn preflight_compact_if_needed<'a>(sess: &Session, prompt: &'a Prompt) -> std::b
             if summaries_inserted >= max_summaries { break; }
             continue;
         } else {
-            // If summarizer failed, drop the slice as a last resort to avoid infinite loop
-            let mut new_rest: Vec<ResponseItem> = Vec::with_capacity(rest.len() - (r.end - r.start));
+            // Gentle fallback: insert a minimal placeholder summary instead of dropping the slice outright.
+            let header = format!("[memory:context v1 | repo={repo_key}]");
+            let placeholder_body = "- Context: truncated older content".to_string();
+            let placeholder_text = format!("{header}\n{placeholder_body}\n");
+            let summary_item = ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText { text: placeholder_text }],
+            };
+            let mut new_rest: Vec<ResponseItem> = Vec::with_capacity(rest.len() - (r.end - r.start) + 1);
             new_rest.extend_from_slice(&rest[..r.start]);
+            new_rest.push(summary_item);
             new_rest.extend_from_slice(&rest[r.end..]);
             rest = new_rest;
             if injection_prefix.is_empty() { p.input = rest.clone(); } else { p.input = [injection_prefix.clone(), rest.clone()].concat(); }
             formatted = p.get_formatted_input();
-            est = estimate_tokens_for_items(&formatted) as u64;
+            est = estimate_tokens_for_items_scaled(sess, &formatted) as u64;
             let used_pct = ((est as f64) / (effective_window as f64) * 100.0) as u64;
             let target_tokens = (target_pct.min(99) as f64 / 100.0 * effective_window as f64) as u64;
             if est <= target_tokens || used_pct < thresholds.iter().min().copied().unwrap_or(75) as u64 { break; }
@@ -3288,6 +3366,46 @@ fn preflight_compact_if_needed<'a>(sess: &Session, prompt: &'a Prompt) -> std::b
     }
 
     std::borrow::Cow::Owned(p)
+}
+
+/// Heuristic salience score for a volley; higher means more important. Used to rank
+/// compaction candidates so low‑salience volleys are summarized first.
+fn volley_salience(items: &[ResponseItem], r: &std::ops::Range<usize>) -> u32 {
+    use crate::models::ContentItem;
+    let mut score = 0u32;
+    for it in &items[r.start..r.end] {
+        match it {
+            ResponseItem::FunctionCall { .. } | ResponseItem::LocalShellCall { .. } => {
+                score += 3;
+            }
+            ResponseItem::FunctionCallOutput { output, .. } => {
+                // Errors and failures increase salience significantly
+                if output.success == Some(false) { score += 4; }
+                let t = output.content.to_lowercase();
+                if t.contains("error:") || t.contains("build failed") { score += 4; }
+                if t.contains("test result:") && t.contains("fail") { score += 3; }
+                if t.contains("*** update file:") || t.contains("apply_patch") { score += 2; }
+            }
+            ResponseItem::Message { content, .. } => {
+                let mut chars = 0usize;
+                for c in content {
+                    match c {
+                        ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                            chars = chars.saturating_add(text.len());
+                            let tl = text.to_lowercase();
+                            if tl.contains("*** update file:") || tl.contains("apply_patch") {
+                                score += 2;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if chars > 500 { score += 2; } else if chars > 200 { score += 1; }
+            }
+            _ => {}
+        }
+    }
+    score
 }
 
 async fn run_compact_agent(
@@ -4890,6 +5008,11 @@ fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -> Option<St
 }
 
 async fn drain_to_completed(sess: &Session, sub_id: &str, prompt: &Prompt) -> CodexResult<()> {
+    // Prepare a base estimate for calibration
+    let base_est_for_turn: u64 = {
+        let items = prompt.get_formatted_input();
+        estimate_tokens_for_items(&items) as u64
+    };
     let mut stream = sess.client.clone().stream(prompt).await?;
     loop {
         let maybe_event = stream.next().await;
@@ -4918,6 +5041,8 @@ async fn drain_to_completed(sess: &Session, sub_id: &str, prompt: &Prompt) -> Co
                         ));
                     }
                 };
+                // Calibrate local token estimate scale and remember last completed usage
+                update_token_estimate_scale_after_completed(sess, &token_usage, base_est_for_turn);
                 // Remember last completed token usage for baseline in post-prune updates
                 {
                     let mut st = sess.state.lock().unwrap();

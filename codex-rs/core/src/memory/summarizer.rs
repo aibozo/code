@@ -274,17 +274,22 @@ pub struct OpenAiNanoSummarizer {
 }
 
 impl OpenAiNanoSummarizer {
-    /// Build from provider definition and codex home (to load API key).
+    /// Build from provider definition and codex home (to load API key or OAuth token).
     pub fn from_provider(
         provider: &ModelProviderInfo,
         codex_home: &std::path::Path,
         model: &str,
         max_chars: usize,
     ) -> std::io::Result<Self> {
-        // Always use API key for this client.
-        let auth = CodexAuth::from_codex_home(codex_home, AuthMode::ApiKey)
+        // Prefer ChatGPT OAuth when available, otherwise fall back to API key.
+        let auth = match CodexAuth::from_codex_home(codex_home, AuthMode::ChatGPT)
             .map_err(|e| std::io::Error::other(format!("auth: {e}")))?
-            .ok_or_else(|| std::io::Error::other("No OpenAI API key found"))?;
+        {
+            Some(a) => a,
+            None => CodexAuth::from_codex_home(codex_home, AuthMode::ApiKey)
+                .map_err(|e| std::io::Error::other(format!("auth: {e}")))?
+                .ok_or_else(|| std::io::Error::other("No OpenAI auth (OAuth or API key) found"))?,
+        };
         let api_key = futures::executor::block_on(auth.get_token())
             .map_err(|e| std::io::Error::other(format!("token: {e}")))?;
 
@@ -309,17 +314,7 @@ impl OpenAiNanoSummarizer {
     }
 
     fn digest_items(&self, items: &[ResponseItem]) -> String {
-        // Reuse the compact logic to produce a small digest as input.
-        let compact = CompactSummarizer { max_chars: self.max_chars.saturating_mul(4) };
-        // CompactSummarizer returns Option<Summary>; if None, fallback to simple join.
-        if let Some(s) = compact.summarize(items) {
-            let mut buf = String::new();
-            buf.push_str(&s.title);
-            buf.push('\n');
-            buf.push_str(&s.text);
-            return buf;
-        }
-        // fallback: stringify messages
+        // Build a concise text digest without using the local summarizer.
         let mut lines = Vec::new();
         for it in items {
             match it {
@@ -337,6 +332,27 @@ impl OpenAiNanoSummarizer {
                     }
                     if !t.trim().is_empty() {
                         lines.push(format!("{}: {}", role, t.trim()));
+                    }
+                }
+                ResponseItem::FunctionCall { name, .. } => {
+                    lines.push(format!("Call: {}", name));
+                }
+                ResponseItem::FunctionCallOutput { output, .. } => {
+                    let status = output.success.map(|b| if b { "ok" } else { "err" }).unwrap_or("n/a");
+                    let mut excerpt: String = output.content.chars().take(120).collect();
+                    if output.content.chars().count() > 120 { excerpt.push('…'); }
+                    if excerpt.is_empty() { excerpt.push_str("<no output>"); }
+                    lines.push(format!("Result({}): {}", status, excerpt));
+                }
+                ResponseItem::LocalShellCall { action, .. } => {
+                    if let crate::models::LocalShellAction::Exec(exec) = action {
+                        let mut cmd = exec.command.join(" ");
+                        if cmd.chars().count() > 120 {
+                            let truncated: String = cmd.chars().take(120).collect();
+                            cmd = format!("{}…", truncated);
+                        }
+                        if cmd.is_empty() { cmd = "<empty>".into(); }
+                        lines.push(format!("Shell: {}", cmd));
                     }
                 }
                 _ => {}
