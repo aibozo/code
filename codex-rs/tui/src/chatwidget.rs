@@ -824,6 +824,59 @@ impl ChatWidget<'_> {
         }
         self.bottom_pane.show_reports_view(lines, None);
     }
+
+    /// Handle /harness commands
+    pub(crate) fn handle_harness_command(&mut self, args: String) {
+        let mut seed: Option<u64> = None;
+        let mut it = args.split_whitespace();
+        let first = it.next();
+        if first.is_none() || first == Some("run") {
+            while let Some(tok) = it.next() {
+                if tok == "--seed" {
+                    if let Some(n) = it.next() {
+                        if let Ok(v) = n.parse::<u64>() { seed = Some(v); }
+                    }
+                }
+            }
+            self.run_harness(seed);
+        }
+    }
+
+    fn run_harness(&mut self, seed: Option<u64>) {
+        self.bottom_pane.set_task_running(true);
+        self.bottom_pane
+            .update_status_text("running harness".to_string());
+        let cwd = self.config.cwd.clone();
+        let app_tx = self.app_event_tx.clone();
+        let day = chrono::Local::now().format("%Y%m%d").to_string();
+        tokio::runtime::Handle::current().spawn(async move {
+            use tokio::process::Command;
+            let mut cmd = Command::new(cwd.join("harness").join("run.sh"));
+            cmd.current_dir(&cwd);
+            if let Some(s) = seed { cmd.arg("--seed").arg(s.to_string()); }
+            let _ = cmd.status().await;
+            // Navigate to the latest run for today
+            let mut runs: Vec<String> = std::fs::read_dir(cwd.join("harness").join("results").join(&day))
+                .ok()
+                .into_iter()
+                .flat_map(|it| it.filter_map(|e| e.ok()).map(|e| e.path()))
+                .filter(|p| p.is_file() && p.extension().map(|s| s == "json").unwrap_or(false))
+                .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()))
+                .collect();
+            runs.sort();
+            if let Some(ts) = runs.pop() {
+                app_tx.send(AppEvent::DispatchCommand(
+                    crate::slash_command::SlashCommand::Reports,
+                    format!("/reports {} {}", day, ts),
+                ));
+            } else {
+                app_tx.send(AppEvent::DispatchCommand(
+                    crate::slash_command::SlashCommand::Reports,
+                    format!("/reports {}", day),
+                ));
+            }
+        });
+    }
     fn perf_label_for_item(&self, item: &dyn HistoryCell) -> String {
         use crate::history_cell::{ExecKind, ExecStatus, HistoryCellType, PatchKind, ToolStatus};
         match item.kind() {

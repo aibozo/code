@@ -80,6 +80,8 @@ pub(crate) struct App<'a> {
     /// starts with our theme background. This avoids terminals that may show
     /// profile defaults until all cells are explicitly painted.
     clear_on_first_frame: bool,
+    /// Optional startup command to dispatch after initialization
+    startup_command: Option<String>,
 }
 
 /// Aggregate parameters needed to create a `ChatWidget`, as creation may be
@@ -357,7 +359,13 @@ impl App<'_> {
             commit_anim_running: Arc::new(AtomicBool::new(false)),
             terminal_info,
             clear_on_first_frame: true,
+            startup_command: None,
         }
+    }
+
+    /// Queue a startup slash command to be dispatched on the next cycle.
+    pub(crate) fn queue_startup_command(&mut self, cmd: String) {
+        self.startup_command = Some(cmd);
     }
 
 
@@ -396,6 +404,17 @@ impl App<'_> {
         // Insert an event to trigger the first render.
         let app_event_tx = self.app_event_tx.clone();
         app_event_tx.send(AppEvent::RequestRedraw);
+
+        // If a startup command is configured, dispatch it immediately after first redraw request.
+        if let Some(cmd) = self.startup_command.take() {
+            match crate::slash_command::process_slash_command_message(&cmd) {
+                crate::slash_command::ProcessedCommand::RegularCommand(command, _args) => {
+                    self.app_event_tx
+                        .send(AppEvent::DispatchCommand(command, cmd.clone()));
+                }
+                _ => {}
+            }
+        }
 
         while let Ok(event) = self.app_event_rx.recv() {
             match event {
@@ -702,6 +721,11 @@ impl App<'_> {
                         SlashCommand::Perf => {
                             if let AppState::Chat { widget } = &mut self.app_state {
                                 widget.handle_perf_command(command_args);
+                            }
+                        }
+                        SlashCommand::Harness => {
+                            if let AppState::Chat { widget } = &mut self.app_state {
+                                widget.handle_harness_command(command_args);
                             }
                         }
                         SlashCommand::Memory => {

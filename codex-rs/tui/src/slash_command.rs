@@ -26,6 +26,7 @@ pub enum SlashCommand {
     Prompts,
     Perf,
     Memory,
+    Harness,
     Reports,
     // Prompt-expanding commands
     Plan,
@@ -59,6 +60,7 @@ impl SlashCommand {
             SlashCommand::Prompts => "show example prompts",
             SlashCommand::Perf => "performance tracing (on/off/show/reset)",
             SlashCommand::Memory => "configure memory (keep-last, summary)",
+            SlashCommand::Harness => "run the evaluation harness",
             SlashCommand::Logout => "log out of Codex",
             SlashCommand::Reports => "show harness reports",
             #[cfg(debug_assertions)]

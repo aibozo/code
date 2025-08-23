@@ -63,6 +63,10 @@ pub struct Cli {
     #[clap(long = "debug", short = 'd', default_value_t = false)]
     pub debug: bool,
 
+    /// Slash command to dispatch on startup (e.g., "/harness run --seed 1337").
+    #[arg(long = "startup-command")]
+    pub startup_command: Option<String>,
+
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
 }

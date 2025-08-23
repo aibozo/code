@@ -287,6 +287,7 @@ fn run_ratatui_app(
         prompt,
         images,
         debug,
+        startup_command,
         ..
     } = cli;
     let mut app = App::new(
@@ -297,6 +298,10 @@ fn run_ratatui_app(
         debug,
         terminal_info,
     );
+
+    if let Some(cmd) = startup_command {
+        app.queue_startup_command(cmd);
+    }
 
     let app_result = app.run(&mut terminal);
     let usage = app.token_usage();
