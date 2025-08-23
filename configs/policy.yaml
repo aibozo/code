@@ -1,0 +1,39 @@
+# Capability levels and allowlists for sandboxed execution
+# These profiles integrate with existing --sandbox and approval policies.
+
+level: READ_ONLY
+
+allowed_commands:
+  READ_ONLY:
+    - /usr/bin/rg
+    - /usr/bin/git
+    - /usr/bin/cat
+    - /usr/bin/node
+    - /usr/bin/python3
+  WORKSPACE_WRITE:
+    - inherit: READ_ONLY
+    - /usr/bin/npm
+    - /usr/bin/pnpm
+    - /usr/bin/cargo
+  SYSTEM_WRITE:
+    - inherit: WORKSPACE_WRITE
+    - /usr/bin/uv
+    - /usr/bin/apt-get
+  GODMODE:
+    - inherit: SYSTEM_WRITE
+
+allowed_hosts:
+  READ_ONLY: []
+  WORKSPACE_WRITE:
+    - github.com
+    - pypi.org
+    - registry.npmjs.org
+  SYSTEM_WRITE:
+    - inherit: WORKSPACE_WRITE
+  GODMODE:
+    - "*"
+
+logging:
+  # Relative to repo by default; CI may relocate to ~/.coder/audit/
+  policy_log: logs/policy.jsonl
+

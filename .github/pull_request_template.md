@@ -1,6 +1,19 @@
-# External (non-OpenAI) Pull Request Requirements
+## Summary
 
-Before opening this Pull Request, please read the "Contributing" section of the README or your PR may be closed:
-https://github.com/openai/codex#contributing
+Link the corresponding doc under `docs/prs/` (e.g., M0, M1...). Provide a concise summary of changes.
 
-If your PR conforms to our contribution guidelines, replace this text with a detailed and high quality description of your changes.
+## Acceptance Criteria
+
+- [ ] Meets criteria listed in the milestone doc
+- [ ] `./build-fast.sh` succeeds
+- [ ] No unrelated changes
+
+## Risk / Rollback
+
+- Risk:
+- Rollback plan:
+
+## Notes
+
+Add screenshots or logs if relevant.
+

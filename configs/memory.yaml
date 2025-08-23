@@ -1,0 +1,23 @@
+compaction:
+  when_context_utilization: ">=0.90"
+  strategy:
+    - summarize
+    - dedup
+    - pin_recent
+
+vector:
+  provider: pgvector
+  index: hnsw
+  dims: 1536
+
+graph:
+  provider: neo4j
+  entities: [Function, File, Test, Issue, Module]
+  relations: [calls, imports, caused_by, validated_by]
+
+retention:
+  pin:
+    recent_successes: 3
+    recent_failures: 2
+  summarize_last_episodes: 4
+
