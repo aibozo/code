@@ -299,7 +299,8 @@ fn limit_screenshots_in_input(input: &mut Vec<ResponseItem>) {
 #[derive(Debug, Serialize)]
 pub(crate) struct ResponsesApiRequest<'a> {
     pub(crate) model: &'a str,
-    pub(crate) instructions: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) instructions: Option<&'a str>,
     // TODO(mbolin): ResponseItem::Other should not be serialized. Currently,
     // we code defensively to avoid this case, but perhaps we should use a
     // separate enum for serialization.

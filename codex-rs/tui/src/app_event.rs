@@ -92,6 +92,9 @@ pub(crate) enum AppEvent {
     StopCommitAnimation,
     CommitTick,
 
+    /// Periodic tick to refresh approvals count in footer (every ~5s)
+    ApprovalsRefresh,
+
     /// Onboarding: result of login_with_chatgpt.
     OnboardingAuthComplete(Result<(), String>),
     OnboardingComplete(ChatWidgetArgs),

@@ -16,6 +16,7 @@ mod bottom_pane_view;
 mod chat_composer;
 mod chat_composer_history;
 pub mod chrome_selection_view;
+mod agent_status_view;
 mod diff_popup;
 mod command_popup;
 mod file_search_popup;
@@ -398,6 +399,14 @@ impl BottomPane<'_> {
         self.request_redraw();
     }
 
+    /// Show the agent status viewer in the bottom pane.
+    pub fn show_agent_status_view(&mut self, lines: Vec<ratatui::text::Line<'static>>) {
+        let view = agent_status_view::AgentStatusView::new(lines, self.app_event_tx.clone());
+        self.active_view = Some(Box::new(view));
+        self.status_view_active = false;
+        self.request_redraw();
+    }
+
     /// Show a generic list selection popup with items and actions.
     pub fn show_list_selection(&mut self, title: String, subtitle: Option<String>, footer: Option<String>, items: Vec<list_selection_view::SelectionItem>) {
         let view = list_selection_view::ListSelectionView::new(title, subtitle, footer, items, self.app_event_tx.clone());
@@ -454,6 +463,12 @@ impl BottomPane<'_> {
 
     pub(crate) fn set_compression_state(&mut self, enabled: bool) {
         self.composer.set_compression_state(enabled);
+        self.request_redraw();
+    }
+
+    /// Update the agents/concurrency indicator in the footer. Pass None to clear.
+    pub(crate) fn set_agent_footer(&mut self, text: Option<String>) {
+        self.composer.set_agent_footer(text);
         self.request_redraw();
     }
 

@@ -37,3 +37,21 @@ logging:
   # Relative to repo by default; CI may relocate to ~/.coder/audit/
   policy_log: logs/policy.jsonl
 
+# Optional defaults control:
+# When disable_builtin_allowlists is true, Codex will not apply its built‑in
+# allowlists for commands/hosts when your policy does not specify entries for a
+# level. This makes the policy file fully authoritative. Note: GODMODE always
+# retains its built‑in host defaults for safety telemetry; this knob is ignored
+# for GODMODE.
+#
+#defaults:
+#  disable_builtin_allowlists: true
+
+# GODMODE options (take effect only when profile is danger‑full‑access):
+# - allow_host_fallback: when true, if no isolation wrapper script is present,
+#   execution may fall back to host with a prominent warning and audit log.
+# - wall_time_secs: optional per‑session budget for high‑privilege execs.
+#
+#godmode:
+#  allow_host_fallback: false
+#  wall_time_secs: 900

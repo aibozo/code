@@ -23,8 +23,15 @@ pub struct TokenData {
 }
 
 impl TokenData {
-    /// Returns true if this is a plan that should use the traditional
-    /// "metered" billing via an API key.
+    /// Decide whether to use the traditional API‑key path for model requests.
+    ///
+    /// Policy:
+    /// - If the caller explicitly prefers API‑key, honor it.
+    /// - If the token email is an @openai.com address, prefer ChatGPT (OAuth).
+    /// - For known consumer/team plans (Free, Plus, Pro, Team), prefer ChatGPT.
+    /// - For known enterprise/edu/business plans, use API‑key.
+    /// - If plan is missing or unknown, prefer ChatGPT (safer default) so
+    ///   primary model traffic uses OAuth even when an API key exists.
     pub(crate) fn should_use_api_key(
         &self,
         preferred_auth_method: AuthMode,
@@ -38,10 +45,11 @@ impl TokenData {
             return false;
         }
 
-        self.id_token
-            .chatgpt_plan_type
-            .as_ref()
-            .is_none_or(|plan| plan.is_plan_that_should_use_api_key())
+        match self.id_token.chatgpt_plan_type.as_ref() {
+            Some(plan) => plan.is_plan_that_should_use_api_key(),
+            // Missing plan info → prefer ChatGPT (OAuth) for primary model calls.
+            None => false,
+        }
     }
 
     pub fn is_openai_email(&self) -> bool {
@@ -84,11 +92,12 @@ impl PlanType {
         match self {
             Self::Known(known) => {
                 use KnownPlan::*;
-                !matches!(known, Free | Plus | Pro | Team)
+                // Enterprise/Business/Edu should use API‑key; consumer/team stays on ChatGPT.
+                matches!(known, Business | Enterprise | Edu)
             }
             Self::Unknown(_) => {
-                // Unknown plans should use the API key.
-                true
+                // Unknown plans: prefer ChatGPT (OAuth) to avoid forcing API if a key exists.
+                false
             }
         }
     }

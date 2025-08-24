@@ -31,6 +31,7 @@ use codex_core::protocol::ErrorEvent;
 use codex_core::protocol::Event;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::ExecApprovalRequestEvent;
+use codex_core::protocol::ReviewDecision;
 use codex_core::protocol::ExecCommandBeginEvent;
 use codex_core::protocol::ExecCommandEndEvent;
 use codex_core::protocol::InputItem;
@@ -43,6 +44,7 @@ use codex_core::protocol::PatchApplyEndEvent;
 use codex_core::protocol::TaskCompleteEvent;
 use codex_core::protocol::TokenUsage;
 use codex_core::protocol::TurnDiffEvent;
+use codex_core::policy_yaml::{PolicyYaml, append_policy_log};
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use image::imageops::FilterType;
@@ -88,6 +90,7 @@ use ratatui::symbols::scrollbar as scrollbar_symbols;
 use serde::{Deserialize, Serialize};
 use codex_core::config::find_codex_home;
 use codex_core::memory::openai_embeddings::has_openai_api_key;
+use std::process::Command as StdCommand;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CachedConnection {
@@ -174,6 +177,8 @@ pub(crate) struct ChatWidget<'a> {
     agent_context: Option<String>,
     agent_task: Option<String>,
     overall_task_status: String,
+    /// Base agent footer text (without approvals count); combined in footer
+    agent_footer_base: Option<String>,
     // Sparkline data for showing agent activity (using RefCell for interior mutability)
     // Each tuple is (value, is_completed) where is_completed indicates if any agent was complete at that time
     sparkline_data: std::cell::RefCell<Vec<(u64, bool)>>,
@@ -224,6 +229,17 @@ pub(crate) struct ChatWidget<'a> {
 
     // UX: allow user to hide/show memory injection notices
     show_injection_notices: bool,
+
+    // Perpetual improvement loop control
+    loop_running: Arc<AtomicBool>,
+    loop_task: Option<tokio::task::JoinHandle<()>>,
+
+    // GODMODE consent gate: require a one-time typed confirmation
+    godmode_consent_pending: bool,
+    // Previous sandbox policy before entering GODMODE so we can revert on /tgm off
+    previous_sandbox_policy: Option<codex_core::protocol::SandboxPolicy>,
+    // Previous approval policy before entering GODMODE to restore on /tgm off
+    previous_approval_policy: Option<codex_core::protocol::AskForApproval>,
 }
 
 // Global guard to prevent overlapping background screenshot captures and to rate-limit them
@@ -384,8 +400,17 @@ struct ItemStat {
 
 #[derive(Debug, Clone)]
 struct AgentInfo {
+    id: String,
     name: String,
     status: AgentStatus,
+    model: Option<String>,
+    created_at: Option<String>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    error: Option<String>,
+    progress_tail: Option<Vec<String>>,
+    worktree_path: Option<String>,
+    branch_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -414,6 +439,403 @@ fn create_initial_user_message(text: String, image_paths: Vec<PathBuf>) -> Optio
 }
 
 impl ChatWidget<'_> {
+    // NOTE: /tgm handler exists later; this stub was removed to avoid duplication.
+
+    fn approvals_pending_count(&self) -> usize {
+        let log_path = self
+            .config
+            .cwd
+            .join(".code")
+            .join("approvals")
+            .join("requests.jsonl");
+        let contents = match std::fs::read_to_string(&log_path) {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
+        use std::collections::{HashMap, HashSet};
+        let mut pending: HashMap<String, serde_json::Value> = HashMap::new();
+        let mut decided: HashSet<String> = HashSet::new();
+        for line in contents.lines() {
+            if line.trim().is_empty() { continue; }
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                let id = val.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let ev = val.get("event").and_then(|v| v.as_str()).unwrap_or("");
+                if id.is_empty() { continue; }
+                match ev {
+                    "approval_request" => { pending.insert(id.clone(), val.clone()); },
+                    "approval_decision" => { decided.insert(id.clone()); },
+                    _ => {}
+                }
+            }
+        }
+        pending.keys().filter(|k| !decided.contains(*k)).count()
+    }
+
+    fn refresh_footer_indicator(&mut self, agent_text: Option<String>) {
+        // Update stored base if provided
+        if agent_text.is_some() { self.agent_footer_base = agent_text.clone(); }
+        let base = agent_text.or_else(|| self.agent_footer_base.clone());
+        let approvals = self.approvals_pending_count();
+        let combined = match (base, approvals) {
+            (Some(a), n) if n > 0 => Some(format!("{} • approvals {}", a, n)),
+            (Some(a), _) => Some(a),
+            (None, n) if n > 0 => Some(format!("approvals {}", n)),
+            _ => None,
+        };
+        self.bottom_pane.set_agent_footer(combined);
+    }
+
+    /// Periodic refresh of approvals count while preserving agent footer base
+    pub(crate) fn refresh_approvals_footer(&mut self) {
+        self.refresh_footer_indicator(None);
+        self.request_redraw();
+    }
+
+    /// Show current safety profile, network status, writable roots, and recent safety logs.
+    pub(crate) fn show_safety_view(&mut self) {
+        use ratatui::text::Line;
+        use crate::bottom_pane::list_selection_view::SelectionItem;
+        let mut header: Vec<Line<'static>> = Vec::new();
+        // Profile
+        let profile = match &self.config.sandbox_policy {
+            codex_core::protocol::SandboxPolicy::ReadOnly => "READ_ONLY",
+            codex_core::protocol::SandboxPolicy::WorkspaceWrite { .. } => "WORKSPACE_WRITE",
+            codex_core::protocol::SandboxPolicy::DangerFullAccess => "GODMODE",
+        };
+        let net = match &self.config.sandbox_policy {
+            codex_core::protocol::SandboxPolicy::ReadOnly => "off",
+            codex_core::protocol::SandboxPolicy::WorkspaceWrite { network_access, .. } => if *network_access { "on" } else { "off" },
+            codex_core::protocol::SandboxPolicy::DangerFullAccess => "on",
+        };
+        header.push(Line::from(format!("Profile: {}", profile)));
+        header.push(Line::from(format!("Network: {}", net)));
+        // Policy level and wrapper
+        if let Some(py) = PolicyYaml::load_from_repo(&self.config.cwd) {
+            if let Some(level) = py.active_level() {
+                header.push(Line::from(format!("Policy level: {}", level)));
+            }
+        }
+        let wrapper = {
+            let firecracker = self.config.cwd.join("sandbox").join("firecracker").join("start.sh");
+            let gvisor = self.config.cwd.join("sandbox").join("gvisor").join("run.sh");
+            if firecracker.is_file() { "firecracker" } else if gvisor.is_file() { "gvisor" } else { "none" }
+        };
+        header.push(Line::from(format!("Wrapper: {}", wrapper)));
+        // Writable roots
+        header.push(Line::from("Writable roots:"));
+        match &self.config.sandbox_policy {
+            codex_core::protocol::SandboxPolicy::WorkspaceWrite { .. } => {
+                for r in self
+                    .config
+                    .sandbox_policy
+                    .get_writable_roots_with_cwd(&self.config.cwd)
+                    .iter()
+                {
+                    header.push(Line::from(format!("- {}", r.root.display())));
+                }
+            }
+            codex_core::protocol::SandboxPolicy::ReadOnly => {
+                header.push(Line::from("- (none)"));
+            }
+            codex_core::protocol::SandboxPolicy::DangerFullAccess => {
+                header.push(Line::from(format!("- {} (project root)", self.config.cwd.display())));
+            }
+        }
+
+        // Recent safety logs
+        let mut items: Vec<SelectionItem> = Vec::new();
+        if let Some(py) = PolicyYaml::load_from_repo(&self.config.cwd) {
+            let p = py.policy_log_path(&self.config.cwd);
+            if let Ok(text) = std::fs::read_to_string(&p) {
+                let mut lines: Vec<&str> = text.lines().collect();
+                let take = 20usize.min(lines.len());
+                for l in lines.drain(lines.len().saturating_sub(take)..) {
+                    if l.trim().is_empty() { continue; }
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(l) {
+                        let ev = val.get("event").and_then(|v| v.as_str()).unwrap_or("");
+                        if !matches!(ev, "exfil_warning" | "warn_disallowed_command" | "godmode_microvm_exec" | "godmode_fallback_host_exec" | "godmode_fallback_blocked" | "startup" | "godmode_consent") { continue; }
+                        let ts = val.get("ts").and_then(|v| v.as_str()).unwrap_or("");
+                        let mut title = format!("{} — {}", ts, ev);
+                        if let Some(h) = val.get("host").and_then(|v| v.as_str()) { title.push_str(&format!(" host={} ", h)); }
+                        if let Some(cmd) = val.get("command") { title.push_str(&format!(" cmd={}", cmd)); }
+                        items.push(SelectionItem { name: title, description: None, is_current: false, actions: Vec::new() });
+                    }
+                }
+            }
+        }
+        if items.is_empty() {
+            items.push(SelectionItem { name: "No recent safety logs.".to_string(), description: None, is_current: false, actions: Vec::new() });
+        }
+
+        // Artifacts root overview (orchestrator/episodes)
+        let artifacts_root = self.config.cwd.join("orchestrator").join("episodes");
+        header.push(Line::from(""));
+        header.push(Line::from(format!("Artifacts root: {}", artifacts_root.display())));
+        if artifacts_root.is_dir() {
+            // Count episodes (subdirectories)
+            let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+            if let Ok(read) = std::fs::read_dir(&artifacts_root) {
+                for e in read.flatten() { let p = e.path(); if p.is_dir() { dirs.push(p); } }
+            }
+            dirs.sort();
+            header.push(Line::from(format!("Episodes: {}", dirs.len())));
+            if let Some(last) = dirs.last() {
+                header.push(Line::from(format!("Last episode: {}", last.file_name().and_then(|s| s.to_str()).unwrap_or("(unknown)"))));
+                let summary = last.join("summary.md");
+                if summary.is_file() {
+                    if let Ok(text) = std::fs::read_to_string(&summary) {
+                        let first = text.lines().next().unwrap_or("");
+                        header.push(Line::from(format!("Last summary: {}", first)));
+                    }
+                }
+            }
+        } else {
+            header.push(Line::from("(root does not exist yet)"));
+        }
+
+        // Checkpoints overview (orchestrator/checkpoints)
+        let ck_root = self.config.cwd.join("orchestrator").join("checkpoints");
+        header.push(Line::from(""));
+        header.push(Line::from(format!("Checkpoints root: {}", ck_root.display())));
+        if ck_root.is_dir() {
+            let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+            if let Ok(read) = std::fs::read_dir(&ck_root) {
+                for e in read.flatten() { let p = e.path(); if p.is_dir() { dirs.push(p); } }
+            }
+            dirs.sort();
+            header.push(Line::from(format!("Total checkpoints: {}", dirs.len())));
+            if let Some(last) = dirs.last() {
+                let id = last.file_name().and_then(|s| s.to_str()).unwrap_or("(unknown)");
+                header.push(Line::from(format!("Latest checkpoint: {}", id)));
+                let man = last.join("manifest.json");
+                if man.is_file() {
+                    if let Ok(text) = std::fs::read_to_string(&man) {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if let Some(ts) = val.get("created_at").and_then(|v| v.as_str()) {
+                                header.push(Line::from(format!("  created_at: {}", ts)));
+                            }
+                            if let Some(note) = val.get("note").and_then(|v| v.as_str()) {
+                                let short = if note.len() > 80 { format!("{}…", &note[..80]) } else { note.to_string() };
+                                if !short.trim().is_empty() { header.push(Line::from(format!("  note: {}", short))); }
+                            }
+                            if let Some(arts) = val.get("artifacts") {
+                                let p = arts.get("prompts").and_then(|v| v.as_bool()).unwrap_or(false);
+                                let s = arts.get("skills").and_then(|v| v.as_bool()).unwrap_or(false);
+                                let c = arts.get("configs").and_then(|v| v.as_bool()).unwrap_or(false);
+                                let m = arts.get("memory").and_then(|v| v.as_bool()).unwrap_or(false);
+                                let h = arts.get("harness").and_then(|v| v.as_bool()).unwrap_or(false);
+                                header.push(Line::from(format!("  artifacts: prompts={} skills={} configs={} memory={} harness={}", p, s, c, m, h)));
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            header.push(Line::from("(no checkpoints yet)"));
+        }
+        let footer = Some("Press Esc to close. Try Ctrl+P for approvals.".to_string());
+        self.bottom_pane.show_list_selection(
+            "Safety".to_string(),
+            Some("Profile, network, writable roots, and recent safety events".to_string()),
+            footer,
+            items,
+        );
+    }
+    /// Show pending approval requests (dependency installs etc.) and allow Approve / Approve for session / Deny.
+    pub(crate) fn show_approvals_view(&mut self) {
+        use crate::bottom_pane::list_selection_view::{SelectionAction, SelectionItem};
+        use crate::app_event::AppEvent;
+        use ratatui::text::Line;
+        // Read JSONL from .code/approvals/requests.jsonl and compute latest state per id
+        let mut pending: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
+        let mut decided: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let log_path = self.config.cwd.join(".code").join("approvals").join("requests.jsonl");
+        if let Ok(contents) = std::fs::read_to_string(&log_path) {
+            for line in contents.lines() {
+                if line.trim().is_empty() { continue; }
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                    let id = val.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let ev = val.get("event").and_then(|v| v.as_str()).unwrap_or("");
+                    if id.is_empty() { continue; }
+                    match ev {
+                        "approval_request" => { pending.insert(id.clone(), val.clone()); },
+                        "approval_decision" => { decided.insert(id.clone()); },
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Build selection items from pending minus decided
+        let mut items: Vec<SelectionItem> = Vec::new();
+        let mut any = false;
+        for (id, obj) in pending.into_iter() {
+            if decided.contains(&id) { continue; }
+            any = true;
+            let call_id = obj.get("call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            // Render a compact title
+            let dep_str = obj
+                .get("dep")
+                .and_then(|d| d.get("packages"))
+                .and_then(|p| p.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" "))
+                .unwrap_or_else(|| "(packages)".to_string());
+            let manager = obj
+                .get("dep")
+                .and_then(|d| d.get("manager"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let title = if manager.is_empty() {
+                format!("Approval: {}", dep_str)
+            } else {
+                format!("{} install: {}", manager, dep_str)
+            };
+            // Actions: Approve, Approve for Session, Deny
+            let id_approve = id.clone();
+            let action_approve: SelectionAction = Box::new(move |tx| {
+                tx.send(AppEvent::CodexOp(Op::ExecApproval { id: id_approve.clone(), decision: ReviewDecision::Approved }));
+            });
+            let id_approve_sess = id.clone();
+            let action_approve_sess: SelectionAction = Box::new(move |tx| {
+                tx.send(AppEvent::CodexOp(Op::ExecApproval { id: id_approve_sess.clone(), decision: ReviewDecision::ApprovedForSession }));
+            });
+            let id_deny = id.clone();
+            let action_deny: SelectionAction = Box::new(move |tx| {
+                tx.send(AppEvent::CodexOp(Op::ExecApproval { id: id_deny.clone(), decision: ReviewDecision::Denied }));
+            });
+            // Build description
+            let ts = obj.get("ts").and_then(|v| v.as_str()).unwrap_or("");
+            let reason = obj.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+            let desc = if reason.is_empty() {
+                format!("id={} call_id={} ts={}", id, call_id, ts)
+            } else {
+                format!("id={} call_id={} ts={} • {}", id, call_id, ts, reason)
+            };
+            items.push(SelectionItem {
+                name: title,
+                description: Some(desc),
+                is_current: false,
+                actions: vec![action_approve, action_approve_sess, action_deny],
+            });
+        }
+        if !any {
+            // Fallback: show no pending approvals
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            lines.push(Line::from("No pending approvals."));
+            lines.push(Line::from("Use '/approvals' after issuing install commands."));
+            self.bottom_pane.show_reports_view(lines, None);
+            return;
+        }
+        self.bottom_pane.show_list_selection(
+            "Approvals".to_string(),
+            Some("Approve/Deny dependency install requests".to_string()),
+            Some("Enter: choose  •  Esc: close".to_string()),
+            items,
+        );
+    }
+
+    /// Handle `/checkpoint [--note <text>]` — wraps scripts/checkpoint.sh.
+    pub(crate) fn handle_checkpoint_command(&mut self, args: String) {
+        // Resolve script
+        let script = self.config.cwd.join("scripts").join("checkpoint.sh");
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if !script.is_file() {
+            lines.push(Line::from(format!("Checkpoint script not found at {}", script.display())));
+            lines.push(Line::from("Please pull latest or run M6 setup."));
+            self.push_notice_lines(lines);
+            self.request_redraw();
+            return;
+        }
+
+        // Build argv: if args is empty, run without flags. If args starts with '-', pass as-is (best effort).
+        // Otherwise treat as note text.
+        let mut argv: Vec<String> = Vec::new();
+        if args.trim().is_empty() {
+            // no-op
+        } else if args.trim_start().starts_with('-') {
+            // naive whitespace split
+            argv.extend(args.split_whitespace().map(|s| s.to_string()));
+        } else {
+            argv.push("--note".to_string());
+            argv.push(args);
+        }
+
+        // Run synchronously (script is fast); capture output for display
+        match StdCommand::new(script)
+            .current_dir(&self.config.cwd)
+            .args(&argv)
+            .output()
+        {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                if out.status.success() {
+                    lines.push(Line::from("✅ Checkpoint created."));
+                    if !stdout.trim().is_empty() {
+                        for l in stdout.lines().take(6) { lines.push(Line::from(l.to_string())); }
+                    }
+                } else {
+                    lines.push(Line::from("❌ Checkpoint failed."));
+                    let mut msg = stderr;
+                    if msg.trim().is_empty() { msg = stdout; }
+                    for l in msg.lines().take(6) { lines.push(Line::from(l.to_string())); }
+                }
+            }
+            Err(e) => {
+                lines.push(Line::from(format!("Failed to run checkpoint: {}", e)));
+            }
+        }
+        self.push_notice_lines(lines);
+        self.request_redraw();
+    }
+
+    /// Handle `/relaunch [<id>|latest] [--profile <...>]` — wraps scripts/relaunch.sh.
+    pub(crate) fn handle_relaunch_command(&mut self, args: String) {
+        let script = self.config.cwd.join("scripts").join("relaunch.sh");
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if !script.is_file() {
+            lines.push(Line::from(format!("Relaunch script not found at {}", script.display())));
+            lines.push(Line::from("Please pull latest or run M6 setup."));
+            self.push_notice_lines(lines);
+            self.request_redraw();
+            return;
+        }
+
+        // Args: default to "latest" if empty. Otherwise naive split.
+        let mut argv: Vec<String> = Vec::new();
+        if args.trim().is_empty() {
+            argv.push("latest".to_string());
+        } else {
+            argv.extend(args.split_whitespace().map(|s| s.to_string()));
+        }
+
+        match StdCommand::new(script)
+            .current_dir(&self.config.cwd)
+            .args(&argv)
+            .output()
+        {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                if out.status.success() {
+                    lines.push(Line::from("✅ Relaunched checkpoint."));
+                    if !stdout.trim().is_empty() {
+                        for l in stdout.lines().take(6) { lines.push(Line::from(l.to_string())); }
+                    }
+                } else {
+                    lines.push(Line::from("❌ Relaunch failed."));
+                    let mut msg = stderr;
+                    if msg.trim().is_empty() { msg = stdout; }
+                    for l in msg.lines().take(6) { lines.push(Line::from(l.to_string())); }
+                }
+            }
+            Err(e) => {
+                lines.push(Line::from(format!("Failed to run relaunch: {}", e)));
+            }
+        }
+        self.push_notice_lines(lines);
+        self.request_redraw();
+    }
     /// Push a Notice cell with the provided lines and redraw.
     pub(crate) fn push_notice_lines(&mut self, lines: Vec<ratatui::text::Line<'static>>) {
         if lines.is_empty() { return; }
@@ -442,13 +864,22 @@ impl ChatWidget<'_> {
                 .and_then(|s| serde_json::from_str(&s).ok());
             if let Some(obj) = last_json {
                 let ts = obj.get("timestamp").and_then(|v| v.as_str()).unwrap_or("unknown");
-                lines.push(Line::from(vec![Span::raw("Harness Report • "), Span::raw(ts.to_string())]));
+                let ctx = obj.get("context").and_then(|v| v.as_str()).unwrap_or("");
+                let header = if ctx.is_empty() {
+                    format!("Harness Report • {}", ts)
+                } else {
+                    format!("Harness Report • {} • context: {}", ts, ctx)
+                };
+                lines.push(Line::from(header));
                 lines.push(Line::from(""));
                 if let Some(stages) = obj.get("stages").and_then(|v| v.as_array()) {
                     for st in stages {
                         let name = st.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                         let status = st.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-                        lines.push(Line::from(format!("{name}: {status}")));
+                        let cached = st.get("cached").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let mut line = format!("{name}: {status}");
+                        if cached { line.push_str(" (cached)"); }
+                        lines.push(Line::from(line));
                         if let Some(metrics) = st.get("metrics").and_then(|v| v.as_object()) {
                             for (k, v) in metrics {
                                 // Render scalar metrics compactly
@@ -499,6 +930,31 @@ impl ChatWidget<'_> {
                         }
                     }
                 }
+
+                // Include latest episode summary and next targets (if present)
+                {
+                    let ep_root = self.config.cwd.join("orchestrator").join("episodes");
+                    let mut eps: Vec<std::path::PathBuf> = std::fs::read_dir(&ep_root)
+                        .ok()
+                        .into_iter()
+                        .flat_map(|it| it.filter_map(|e| e.ok()).map(|e| e.path()))
+                        .filter(|p| p.is_dir())
+                        .collect();
+                    eps.sort();
+                    if let Some(last_ep) = eps.last() {
+                        let summary_path = last_ep.join("summary.md");
+                        if summary_path.is_file() {
+                            if let Ok(txt) = std::fs::read_to_string(&summary_path) {
+                                use ratatui::text::Span;
+                                lines.push(Line::from(""));
+                                lines.push(Line::from(Span::raw("Episode Summary:")));
+                                for l in txt.lines().take(6) {
+                                    lines.push(Line::from(format!("  {}", l)));
+                                }
+                            }
+                        }
+                    }
+                }
             } else {
                 lines.push(Line::from("No parsable harness results found."));
             }
@@ -528,7 +984,42 @@ impl ChatWidget<'_> {
             self.show_reports_view();
             return;
         }
-        let items: Vec<SelectionItem> = dates
+        let mut items: Vec<SelectionItem> = Vec::new();
+        // Prepend By Context entry
+        {
+            let action_context: SelectionAction = Box::new(|tx| {
+                tx.send(AppEvent::DispatchCommand(SlashCommand::Reports, "/reports context".to_string()));
+            });
+            items.push(SelectionItem {
+                name: "By Context…".to_string(),
+                description: Some("Browse runs grouped by context label".to_string()),
+                is_current: false,
+                actions: vec![action_context],
+            });
+        }
+        // Prepend Trends entries
+        {
+            let action7: SelectionAction = Box::new(|tx| {
+                tx.send(AppEvent::DispatchCommand(SlashCommand::Reports, "/reports trends 7".to_string()));
+            });
+            items.push(SelectionItem {
+                name: "Trends (7d)".to_string(),
+                description: Some("Daily ok/error bars for recent week".to_string()),
+                is_current: false,
+                actions: vec![action7],
+            });
+            let action30: SelectionAction = Box::new(|tx| {
+                tx.send(AppEvent::DispatchCommand(SlashCommand::Reports, "/reports trends 30".to_string()));
+            });
+            items.push(SelectionItem {
+                name: "Trends (30d)".to_string(),
+                description: Some("Daily ok/error bars for recent month".to_string()),
+                is_current: false,
+                actions: vec![action30],
+            });
+        }
+        // Add date directories
+        items.extend(dates
             .into_iter()
             .rev()
             .map(|day| {
@@ -545,13 +1036,171 @@ impl ChatWidget<'_> {
                     actions: vec![action],
                 }
             })
-            .collect();
+            .collect::<Vec<_>>());
         self.bottom_pane.show_list_selection(
             "Harness Reports".to_string(),
             Some("Choose a date".to_string()),
             Some("Enter: open  •  Esc: close".to_string()),
             items,
         );
+    }
+
+    /// Show a picker of available context labels aggregated across all runs.
+    pub(crate) fn show_reports_context_picker(&mut self) {
+        use crate::bottom_pane::list_selection_view::{SelectionAction, SelectionItem};
+        use crate::app_event::AppEvent;
+        use crate::slash_command::SlashCommand;
+        use std::collections::HashMap as Map;
+        let results_dir = self.config.cwd.join("harness").join("results");
+        let mut counts: Map<String, usize> = Map::new();
+        if let Ok(days) = std::fs::read_dir(&results_dir) {
+            for de in days.flatten() {
+                let day_name = match de.file_name().into_string() {
+                    Ok(s) if s.len() == 8 && s.chars().all(|c| c.is_ascii_digit()) => s,
+                    _ => continue,
+                };
+                let day_path = results_dir.join(&day_name);
+                if let Ok(files) = std::fs::read_dir(&day_path) {
+                    for fe in files.flatten() {
+                        let p = fe.path();
+                        if !(p.is_file() && p.extension().map(|s| s == "json").unwrap_or(false)) {
+                            continue;
+                        }
+                        let s = match std::fs::read_to_string(&p) { Ok(s) => s, Err(_) => continue };
+                        let Ok(val) = serde_json::from_str::<serde_json::Value>(&s) else { continue };
+                        if let Some(label) = val.get("context").and_then(|v| v.as_str()) {
+                            let label = label.trim();
+                            if !label.is_empty() {
+                                *counts.entry(label.to_string()).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut items: Vec<SelectionItem> = Vec::new();
+        if counts.is_empty() {
+            items.push(SelectionItem {
+                name: "No contexts found".to_string(),
+                description: Some("Run with --context NAME to tag runs".to_string()),
+                is_current: true,
+                actions: vec![],
+            });
+        } else {
+            let mut labels: Vec<(String, usize)> = counts.into_iter().collect();
+            labels.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+            for (label, count) in labels {
+                let lbl_for_action = label.clone();
+                let action: SelectionAction = Box::new(move |tx| {
+                    tx.send(AppEvent::DispatchCommand(SlashCommand::Reports, format!("/reports context {}", lbl_for_action)));
+                });
+                items.push(SelectionItem {
+                    name: label.clone(),
+                    description: Some(format!("{} runs", count)),
+                    is_current: false,
+                    actions: vec![action],
+                });
+            }
+        }
+        self.bottom_pane.show_list_selection(
+            "Harness Reports • By Context".to_string(),
+            Some("Choose a context label".to_string()),
+            Some("Enter: open  •  Esc: back".to_string()),
+            items,
+        );
+    }
+
+    /// Show runs across all dates filtered by a context label.
+    pub(crate) fn show_reports_by_context(&mut self, label: &str) {
+        use crate::bottom_pane::list_selection_view::{SelectionAction, SelectionItem};
+        use crate::app_event::AppEvent;
+        use crate::slash_command::SlashCommand;
+        let results_dir = self.config.cwd.join("harness").join("results");
+        let mut items: Vec<SelectionItem> = Vec::new();
+        if let Ok(days) = std::fs::read_dir(&results_dir) {
+            let mut pairs: Vec<(String, String)> = Vec::new(); // (day, ts)
+            for de in days.flatten() {
+                let day_name = match de.file_name().into_string() { Ok(s) if s.len()==8 && s.chars().all(|c| c.is_ascii_digit()) => s, _ => continue };
+                let day_path = de.path();
+                if let Ok(files) = std::fs::read_dir(&day_path) {
+                    for fe in files.flatten() {
+                        let p = fe.path();
+                        if !(p.is_file() && p.extension().map(|s| s=="json").unwrap_or(false)) { continue; }
+                        let s = match std::fs::read_to_string(&p) { Ok(s) => s, Err(_) => continue };
+                        let Ok(val) = serde_json::from_str::<serde_json::Value>(&s) else { continue };
+                        if val.get("context").and_then(|v| v.as_str()) == Some(label) {
+                            let ts = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                            pairs.push((day_name.clone(), ts));
+                        }
+                    }
+                }
+            }
+            // sort newest first
+            pairs.sort();
+            for (day, ts) in pairs.into_iter().rev() {
+                let name = format!("{} {}", &day, &ts);
+                let day_for_action = day.clone();
+                let ts_for_action = ts.clone();
+                let action: SelectionAction = Box::new(move |tx| {
+                    tx.send(AppEvent::DispatchCommand(SlashCommand::Reports, format!("/reports {} {}", day_for_action, ts_for_action)));
+                });
+                items.push(SelectionItem {
+                    name,
+                    description: Some(format!("context: {}", label)),
+                    is_current: false,
+                    actions: vec![action],
+                });
+            }
+        }
+        if items.is_empty() {
+            items.push(SelectionItem { name: "No runs found".to_string(), description: None, is_current: true, actions: vec![] });
+        }
+        self.bottom_pane.show_list_selection(
+            format!("Harness Reports • context: {}", label),
+            Some("Choose a run".to_string()),
+            Some("Enter: open  •  Esc: close".to_string()),
+            items,
+        );
+    }
+
+    /// Show a simple daily trend chart for the last N days (default 7).
+    pub(crate) fn show_trends(&mut self, days: usize) {
+        use ratatui::text::Line;
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let results_dir = self.config.cwd.join("harness").join("results");
+        let mut day_dirs: Vec<String> = std::fs::read_dir(&results_dir)
+            .ok()
+            .into_iter()
+            .flat_map(|it| it.filter_map(|e| e.ok()))
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|name| name.len() == 8 && name.chars().all(|c| c.is_ascii_digit()))
+            .collect();
+        day_dirs.sort();
+        let slice = if day_dirs.len() > days { &day_dirs[day_dirs.len()-days..] } else { &day_dirs[..] };
+        lines.push(Line::from(format!("Trends (last {}d)", slice.len())));
+        lines.push(Line::from(""));
+        for day in slice {
+            let dir = results_dir.join(day);
+            let sum_path = dir.join("_daily_summary.json");
+            let (ok_sum, err_sum) = if let Ok(s) = std::fs::read_to_string(&sum_path) {
+                if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&s) {
+                    let ok = obj.get("total_ok").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let err = obj.get("total_error").and_then(|v| v.as_i64()).unwrap_or(0);
+                    (ok, err)
+                } else { (0,0) }
+            } else { (0,0) };
+            // Simple bar visualization with fixed width
+            let total = (ok_sum + err_sum).max(1);
+            let width = 30i64;
+            let ok_w = (ok_sum * width) / total;
+            let err_w = width - ok_w;
+            let bar = format!("{}{}", "█".repeat(ok_w as usize), "░".repeat(err_w as usize));
+            let day_disp = format!("{}-{}-{}", &day[0..4], &day[4..6], &day[6..8]);
+            lines.push(Line::from(format!("{}  {}  ok {} • err {}", day_disp, bar, ok_sum, err_sum)));
+        }
+        if slice.is_empty() { lines.push(Line::from("No historical runs yet.")); }
+        self.bottom_pane.show_reports_view(lines, None);
     }
 
     /// Show reports view for a specific YYYYMMDD date directory.
@@ -572,14 +1221,23 @@ impl ChatWidget<'_> {
                 .and_then(|s| serde_json::from_str(&s).ok());
             if let Some(obj) = last_json {
                 let ts = obj.get("timestamp").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let ctx = obj.get("context").and_then(|v| v.as_str()).unwrap_or("");
                 let day_disp = if day.len() == 8 { format!("{}-{}-{}", &day[0..4], &day[4..6], &day[6..8]) } else { day.to_string() };
-                lines.push(Line::from(vec![Span::raw("Harness Report • "), Span::raw(day_disp), Span::raw(" • "), Span::raw(ts.to_string())]));
+                let header = if ctx.is_empty() {
+                    format!("Harness Report • {} • {}", day_disp, ts)
+                } else {
+                    format!("Harness Report • {} • {} • context: {}", day_disp, ts, ctx)
+                };
+                lines.push(Line::from(header));
                 lines.push(Line::from(""));
                 if let Some(stages) = obj.get("stages").and_then(|v| v.as_array()) {
                     for st in stages {
                         let name = st.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                         let status = st.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-                        lines.push(Line::from(format!("{name}: {status}")));
+                        let cached = st.get("cached").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let mut line = format!("{name}: {status}");
+                        if cached { line.push_str(" (cached)"); }
+                        lines.push(Line::from(line));
                         if let Some(metrics) = st.get("metrics").and_then(|v| v.as_object()) {
                             for (k, v) in metrics {
                                 let val = if v.is_string() || v.is_number() || v.is_boolean() {
@@ -624,6 +1282,30 @@ impl ChatWidget<'_> {
                         let d_err = err_now - err_prev;
                         lines.push(Line::from(""));
                         lines.push(Line::from(format!("Δ vs previous • ok: {:+}, error: {:+}", d_ok, d_err)));
+                    }
+                }
+                // Include latest episode summary for discoverability
+                {
+                    let ep_root = self.config.cwd.join("orchestrator").join("episodes");
+                    let mut eps: Vec<std::path::PathBuf> = std::fs::read_dir(&ep_root)
+                        .ok()
+                        .into_iter()
+                        .flat_map(|it| it.filter_map(|e| e.ok()).map(|e| e.path()))
+                        .filter(|p| p.is_dir())
+                        .collect();
+                    eps.sort();
+                    if let Some(last_ep) = eps.last() {
+                        let summary_path = last_ep.join("summary.md");
+                        if summary_path.is_file() {
+                            if let Ok(txt) = std::fs::read_to_string(&summary_path) {
+                                use ratatui::text::Span;
+                                lines.push(Line::from(""));
+                                lines.push(Line::from(Span::raw("Episode Summary:")));
+                                for l in txt.lines().take(6) {
+                                    lines.push(Line::from(format!("  {}", l)));
+                                }
+                            }
+                        }
                     }
                 }
             } else {
@@ -756,7 +1438,10 @@ impl ChatWidget<'_> {
                     for st in stages {
                         let name = st.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                         let status = st.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-                        lines.push(Line::from(format!("{name}: {status}")));
+                        let cached = st.get("cached").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let mut line = format!("{name}: {status}");
+                        if cached { line.push_str(" (cached)"); }
+                        lines.push(Line::from(line));
                         if let Some(metrics) = st.get("metrics").and_then(|v| v.as_object()) {
                             for (k, v) in metrics {
                                 let val = if v.is_string() || v.is_number() || v.is_boolean() {
@@ -804,9 +1489,10 @@ impl ChatWidget<'_> {
                 let runs_count = obj.get("runs_count").and_then(|v| v.as_i64()).unwrap_or(0);
                 let total_ok = obj.get("total_ok").and_then(|v| v.as_i64()).unwrap_or(0);
                 let total_err = obj.get("total_error").and_then(|v| v.as_i64()).unwrap_or(0);
+                let total_cached = obj.get("total_cached").and_then(|v| v.as_i64()).unwrap_or(0);
                 let improved = obj.get("improved_runs").and_then(|v| v.as_i64()).unwrap_or(0);
                 lines.push(Line::from(format!("Runs: {}", runs_count)));
-                lines.push(Line::from(format!("Σ ok: {}  •  Σ error: {}", total_ok, total_err)));
+                lines.push(Line::from(format!("Σ ok: {}  •  Σ error: {}  •  Σ cached: {}", total_ok, total_err, total_cached)));
                 lines.push(Line::from(format!("Improved vs prior: {}", improved)));
                 lines.push(Line::from(""));
                 if let Some(runs) = obj.get("runs").and_then(|v| v.as_array()) {
@@ -814,7 +1500,8 @@ impl ChatWidget<'_> {
                         let ts = r.get("ts").and_then(|v| v.as_str()).unwrap_or("?");
                         let ok = r.get("ok").and_then(|v| v.as_i64()).unwrap_or(0);
                         let err = r.get("error").and_then(|v| v.as_i64()).unwrap_or(0);
-                        lines.push(Line::from(format!("{ts}: ok {ok} • error {err}")));
+                        let cached = r.get("cached").and_then(|v| v.as_i64()).unwrap_or(0);
+                        lines.push(Line::from(format!("{ts}: ok {ok} • error {err} • cached {cached}")));
                     }
                 }
             }
@@ -1551,6 +2238,7 @@ impl ChatWidget<'_> {
             agent_context: None,
             agent_task: None,
             overall_task_status: "preparing".to_string(),
+            agent_footer_base: None,
             sparkline_data: std::cell::RefCell::new(Vec::new()),
             last_sparkline_update: std::cell::RefCell::new(std::time::Instant::now()),
             stream: crate::streaming::controller::StreamController::new(config.clone()),
@@ -1575,17 +2263,353 @@ impl ChatWidget<'_> {
             perf_enabled: false,
             perf: std::cell::RefCell::new(PerfStats::default()),
             show_injection_notices: true,
-        };
+            loop_running: Arc::new(AtomicBool::new(false)),
+    loop_task: None,
+    godmode_consent_pending: false,
+    previous_sandbox_policy: None,
+    previous_approval_policy: None,
+};
         // Initialize footer compression hint state from config
         new_widget
             .bottom_pane
             .set_compression_state(new_widget.config.memory.enabled);
         new_widget.bottom_pane.set_compression_hint(true);
 
+        // No consent gate by default; /tgm handles toggling with a confirmation.
+
         // Note: Initial redraw needs to be triggered after widget is added to app_state
         // ready; trigger initial redraw
         
         new_widget
+    }
+
+    /// Handle `/loop` command: start|stop|status|sprint <goal> [--seed N] [--context NAME]
+    pub(crate) fn handle_loop_command(&mut self, args: String) {
+        let parts: Vec<&str> = args.split_whitespace().collect();
+        let sub = parts.get(0).copied().unwrap_or("status");
+        match sub {
+            "start" => {
+                if self.loop_running.load(Ordering::Relaxed) {
+                    self.push_notice_lines(vec![ratatui::text::Line::from("Perpetual loop already running.")]);
+                    return;
+                }
+                // Parse optional flags: --interval SEC, --once, --context NAME, --wall-time N
+                let mut interval_secs: Option<u64> = None;
+                let mut once = false;
+                let mut context: Option<String> = None;
+                let mut wall_time: Option<u64> = None;
+                let mut i = 1usize;
+                while i < parts.len() {
+                    match parts[i] {
+                        "--interval" => { if i + 1 < parts.len() { interval_secs = parts[i+1].parse::<u64>().ok(); i += 1; } }
+                        "--once" => { once = true; }
+                        "--context" => { if i + 1 < parts.len() { context = Some(parts[i+1].to_string()); i += 1; } }
+                        "--wall-time" => { if i + 1 < parts.len() { wall_time = parts[i+1].parse::<u64>().ok(); i += 1; } }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                self.loop_running.store(true, Ordering::Relaxed);
+                self.push_notice_lines(vec![ratatui::text::Line::from("Perpetual loop: started")] );
+                let running = self.loop_running.clone();
+                let tx = self.app_event_tx.clone();
+                let cwd = self.config.cwd.clone();
+                let cfg = self.config.clone();
+                let ctx_label = context.unwrap_or_else(|| "loop".to_string());
+                self.loop_task = Some(tokio::spawn(async move {
+                    use std::time::Duration as StdDur;
+                    loop {
+                        if !running.load(Ordering::Relaxed) { break; }
+                        // Compact context to keep memory bounded between phases
+                        tx.send(AppEvent::CodexOp(Op::Compact));
+                        // Run orchestrator improve once per loop
+                        let goal = "perpetual improvement run".to_string();
+                        let opts = codex_core::orchestrator::ImproveOptions {
+                            goal,
+                            max_attempts: 1,
+                            no_approval: true,
+                            budgets: codex_core::orchestrator::Budgets { wall_time_secs: wall_time, token_budget: None, max_concurrency: None },
+                            context_label: Some(ctx_label.clone()),
+                        };
+                        let res = codex_core::orchestrator::run_improve(&cfg, opts).await;
+                        // Navigate to the latest report on success
+                        let day = chrono::Local::now().format("%Y%m%d").to_string();
+                        if let Ok(ok) = res {
+                            if let (Some(d), Some(ts)) = (ok.last_run_day, ok.last_run_ts) {
+                                tx.send(AppEvent::DispatchCommand(
+                                    crate::slash_command::SlashCommand::Reports,
+                                    format!("/reports {} {}", d, ts),
+                                ));
+                            } else {
+                                tx.send(AppEvent::DispatchCommand(
+                                    crate::slash_command::SlashCommand::Reports,
+                                    format!("/reports {}", day),
+                                ));
+                            }
+                        } else {
+                            tx.send(AppEvent::DispatchCommand(
+                                crate::slash_command::SlashCommand::Reports,
+                                format!("/reports {}", day),
+                            ));
+                        }
+                        if once { break; }
+                        if let Some(sec) = interval_secs { tokio::time::sleep(StdDur::from_secs(sec.max(1))).await; } else { tokio::task::yield_now().await; }
+                    }
+                }));
+            }
+            "stop" => {
+                self.loop_running.store(false, Ordering::Relaxed);
+                self.push_notice_lines(vec![ratatui::text::Line::from("Perpetual loop: stopped")] );
+            }
+            "sprint" => {
+                // Spawn a short improvement sprint (runs harness and surfaces report)
+                let mut seed: Option<u64> = None;
+                let mut it = parts.iter().copied();
+                let _ = it.next(); // consume subcommand
+                // Remaining args may include a free-form goal and optional --seed N
+                while let Some(tok) = it.next() {
+                    if tok == "--seed" {
+                        if let Some(n) = it.next() { seed = n.parse::<u64>().ok(); }
+                    }
+                }
+                let cwd = self.config.cwd.clone();
+                let tx = self.app_event_tx.clone();
+                self.bottom_pane.set_task_running(true);
+                self.bottom_pane.update_status_text("running sprint".to_string());
+                tokio::spawn(async move {
+                    use tokio::process::Command;
+                    let mut cmd = Command::new(cwd.join("harness").join("run.sh"));
+                    cmd.current_dir(&cwd);
+                    if let Some(s) = seed { cmd.arg("--seed").arg(s.to_string()); }
+                    let _ = cmd.status().await;
+                    let day = chrono::Local::now().format("%Y%m%d").to_string();
+                    let mut runs: Vec<String> = std::fs::read_dir(cwd.join("harness").join("results").join(&day))
+                        .ok()
+                        .into_iter()
+                        .flat_map(|it| it.filter_map(|e| e.ok()).map(|e| e.path()))
+                        .filter(|p| p.is_file() && p.extension().map(|s| s == "json").unwrap_or(false))
+                        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()))
+                        .collect();
+                    runs.sort();
+                    if let Some(ts) = runs.pop() {
+                        // Ingest episode and run into graph (best-effort)
+                        let _ = (|| {
+                            let g = codex_memory::graph::FileGraph::new(&cwd).map_err(|e| std::io::Error::other(e.to_string()))?;
+                            let run_path = cwd.join("harness").join("results").join(&day).join(format!("{}.json", ts));
+                            let ep_dir = cwd.join("orchestrator").join("episodes").join(&day); // last created ts is different; keep best effort
+                            let _ = codex_memory::graph::ingest:: ingest_run_file(&g, &run_path);
+                            let _ = codex_memory::graph::ingest:: ingest_episode_dir(&g, &ep_dir);
+                            Ok::<(), std::io::Error>(())
+                        })();
+                        tx.send(AppEvent::DispatchCommand(
+                            crate::slash_command::SlashCommand::Reports,
+                            format!("/reports {} {}", day, ts),
+                        ));
+                    }
+                });
+            }
+            _ => {
+                let state = if self.loop_running.load(Ordering::Relaxed) {
+                    "running"
+                } else {
+                    "stopped"
+                };
+                let msg = format!("Perpetual loop status: {state}");
+                self.push_notice_lines(vec![ratatui::text::Line::from(msg)]);
+            }
+        }
+    }
+
+    /// Handle `/improve <goal> [--max-attempts N] [--no-approval]` (M4 supervisor MVP)
+    pub(crate) fn handle_improve_command(&mut self, args: String) {
+        let mut goal = String::new();
+        let mut max_attempts: usize = 1;
+        let mut no_approval = false;
+        let mut wall_time_secs: Option<u64> = None;
+        let mut token_budget: Option<u64> = None;
+        let mut concurrency: Option<u32> = None;
+        let mut context_label: Option<String> = None;
+        // Simple flag parser: everything until a flag is the goal string
+        let mut tokens = args.split_whitespace().peekable();
+        if let Some(first) = tokens.peek().copied() {
+            match first {
+                "pause" => {
+                    codex_core::orchestrator::pause();
+                    self.push_notice_lines(vec![ratatui::text::Line::from("Improve: paused")]);
+                    return;
+                }
+                "resume" => {
+                    codex_core::orchestrator::resume();
+                    self.push_notice_lines(vec![ratatui::text::Line::from("Improve: resumed")]);
+                    return;
+                }
+                "status" => {
+                    let s = if codex_core::orchestrator::is_paused() { "paused" } else { "running" };
+                    self.push_notice_lines(vec![ratatui::text::Line::from(format!("Improve status: {}", s))]);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        while let Some(&tok) = tokens.peek() {
+            if tok.starts_with("--") { break; }
+            goal.push_str(tok);
+            goal.push(' ');
+            tokens.next();
+        }
+        // Trim goal
+        goal = goal.trim().to_string();
+        // Parse flags
+        while let Some(tok) = tokens.next() {
+            match tok {
+                "--max-attempts" => {
+                    if let Some(n) = tokens.next() { max_attempts = n.parse::<usize>().unwrap_or(1); }
+                }
+                "--no-approval" => { no_approval = true; }
+                "--wall-time" => { if let Some(n) = tokens.next() { wall_time_secs = n.parse::<u64>().ok(); } }
+                "--token-budget" => { if let Some(n) = tokens.next() { token_budget = n.parse::<u64>().ok(); } }
+                "--concurrency" => { if let Some(n) = tokens.next() { concurrency = n.parse::<u32>().ok(); } }
+                "--context" => { if let Some(n) = tokens.next() { context_label = Some(n.to_string()); } }
+                _ => {}
+            }
+        }
+
+        if goal.is_empty() {
+            self.push_notice_lines(vec![ratatui::text::Line::from("Usage: /improve <goal> [--max-attempts N] [--no-approval]")]);
+            return;
+        }
+
+        self.bottom_pane.set_task_running(true);
+        self.bottom_pane.update_status_text(format!("improving: {}", goal));
+        let cwd = self.config.cwd.clone();
+        let cfg = self.config.clone();
+        let tx = self.app_event_tx.clone();
+        let budget_wall = wall_time_secs;
+        let budget_tokens = token_budget;
+        let budget_conc = concurrency;
+        tokio::spawn(async move {
+            let mut cfg = cfg;
+            cfg.cwd = cwd.clone();
+            let opts = codex_core::orchestrator::ImproveOptions {
+                goal,
+                max_attempts: max_attempts.max(1),
+                no_approval,
+                budgets: codex_core::orchestrator::Budgets { wall_time_secs, token_budget, max_concurrency: concurrency },
+                context_label,
+            };
+            match codex_core::orchestrator::run_improve(&cfg, opts).await {
+                Ok(res) => {
+                    let msg = format!(
+                        "Improve: accepted={} attempts={} Δok={} Δerr={} last={}/{}",
+                        res.accepted,
+                        res.attempts,
+                        res.delta_ok.map(|v| v.to_string()).unwrap_or_else(|| "n/a".to_string()),
+                        res.delta_error.map(|v| v.to_string()).unwrap_or_else(|| "n/a".to_string()),
+                        res.last_run_day.clone().unwrap_or_else(|| "n/a".to_string()),
+                        res.last_run_ts.clone().unwrap_or_else(|| "n/a".to_string()),
+                    );
+                    tx.send(AppEvent::InsertHistory(vec![ratatui::text::Line::from(msg)]));
+                    // Budget visibility line only when budgets provided
+                    if budget_wall.is_some() || budget_tokens.is_some() || budget_conc.is_some() {
+                        let bmsg = format!(
+                            "Budget: wall_time={}s tokens={} concurrency={}",
+                            budget_wall.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
+                            budget_tokens.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
+                            budget_conc.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string())
+                        );
+                        tx.send(AppEvent::InsertHistory(vec![ratatui::text::Line::from(bmsg)]));
+                    }
+                    if let (Some(day), Some(ts)) = (res.last_run_day, res.last_run_ts) {
+                        tx.send(AppEvent::DispatchCommand(
+                            crate::slash_command::SlashCommand::Reports,
+                            format!("/reports {} {}", day, ts),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    tx.send(AppEvent::InsertHistory(vec![ratatui::text::Line::from(format!("Improve failed: {}", e))]));
+                }
+            }
+            tx.send(AppEvent::ImmediateRedraw);
+        });
+    }
+
+    /// Accept current session changes (no-op if none recorded)
+    pub(crate) fn handle_accept_command(&mut self) {
+        let mut changed_paths: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+        for m in &self.session_patch_sets { for p in m.keys() { changed_paths.insert(p.clone()); } }
+        let changed_files = changed_paths.len();
+        if changed_files == 0 {
+            self.push_notice_lines(vec![ratatui::text::Line::from("No pending changes to accept.")]);
+            return;
+        }
+        // Persist decision to latest episode dir and ingest
+        let written = self.persist_episode_decision("accepted", changed_paths.iter().cloned().collect());
+        self.push_notice_lines(vec![ratatui::text::Line::from(format!("Accepted current changes ({} files); wrote decision to latest episode ({})", changed_files, written))]);
+        // Clear recorded patch sets to avoid re-showing the same changes
+        self.session_patch_sets.clear();
+    }
+
+    /// Revert current session changes to captured baselines
+    pub(crate) fn handle_revert_command(&mut self) {
+        use std::io::Write;
+        if self.baseline_file_contents.is_empty() {
+            self.push_notice_lines(vec![ratatui::text::Line::from("No captured baselines; nothing to revert.")]);
+            return;
+        }
+        let mut reverted = 0usize;
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for (path, baseline) in self.baseline_file_contents.iter() {
+            if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
+            if std::fs::write(path, baseline).is_ok() { reverted += 1; }
+            paths.push(path.clone());
+        }
+        self.session_patch_sets.clear();
+        self.baseline_file_contents.clear();
+        // Persist decision to latest episode dir and ingest
+        let written = self.persist_episode_decision("reverted", paths);
+        self.push_notice_lines(vec![ratatui::text::Line::from(format!("Reverted {} files to baseline; wrote decision to latest episode ({})", reverted, written))]);
+    }
+
+    /// Return latest episode dir, creating one if none exist.
+    fn latest_or_new_episode_dir(&self) -> std::path::PathBuf {
+        let root = self.config.cwd.join("orchestrator").join("episodes");
+        let _ = std::fs::create_dir_all(&root);
+        let mut eps: Vec<std::path::PathBuf> = std::fs::read_dir(&root)
+            .ok()
+            .into_iter()
+            .flat_map(|it| it.filter_map(|e| e.ok()).map(|e| e.path()))
+            .filter(|p| p.is_dir())
+            .collect();
+        eps.sort();
+        if let Some(last) = eps.last() { return last.clone(); }
+        let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+        let dir = root.join(ts);
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// Persist accept/revert decision into latest episode and best-effort ingest.
+    fn persist_episode_decision(&self, kind: &str, files: Vec<PathBuf>) -> usize {
+        let ep_dir = self.latest_or_new_episode_dir();
+        let decision_path = ep_dir.join("decision.md");
+        let now = chrono::Local::now().to_rfc3339();
+        let mut body = String::new();
+        body.push_str("# Decision\n");
+        body.push_str(&format!("Type: {}\n", kind));
+        body.push_str(&format!("Time: {}\n", now));
+        body.push_str(&format!("Files: {}\n\n", files.len()));
+        for p in &files { body.push_str(&format!("- {}\n", p.display())); }
+        let _ = std::fs::write(&decision_path, body);
+        // Also write a machine-friendly list
+        let _ = std::fs::write(ep_dir.join("files.txt"), files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"));
+        // Best-effort ingest episode dir
+        let _ = (|| {
+            let g = codex_memory::graph::FileGraph::new(&self.config.cwd).map_err(|e| std::io::Error::other(e.to_string()))?;
+            let _ = codex_memory::graph::ingest::ingest_episode_dir(&g, &ep_dir);
+            Ok::<(), std::io::Error>(())
+        })();
+        1
     }
 
     /// Check if there are any animations and trigger redraw if needed
@@ -1638,6 +2662,35 @@ impl ChatWidget<'_> {
     }
 
     pub(crate) fn handle_key_event(&mut self, key_event: KeyEvent) {
+        // Global hotkey: Ctrl+A opens Agent Status view without interrupting background work.
+        if key_event.kind == KeyEventKind::Press {
+            if let KeyEvent { code: crossterm::event::KeyCode::Char('a'), modifiers, .. } = key_event {
+                if modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+                    // Build initial snapshot lines
+                    use ratatui::text::Line;
+                    let mut lines: Vec<Line<'static>> = Vec::new();
+                    let header = "Agent Status".to_string();
+                    lines.push(Line::from(header));
+                    lines.push(Line::from(""));
+                    if let Some(ctx) = &self.agent_context { if !ctx.is_empty() { lines.push(Line::from(format!("context: {}", ctx))); } }
+                    if let Some(task) = &self.agent_task { if !task.is_empty() { lines.push(Line::from(format!("task: {}", task))); } }
+                    if self.active_agents.is_empty() {
+                        lines.push(Line::from("no agents"));
+                    } else {
+                        let mut running = 0usize; let mut pending = 0usize; let mut completed = 0usize; let mut failed = 0usize;
+                        for a in &self.active_agents { match a.status { AgentStatus::Running => running+=1, AgentStatus::Pending => pending+=1, AgentStatus::Completed => completed+=1, AgentStatus::Failed => failed+=1 } }
+                        lines.push(Line::from(format!("summary: running {} • pending {} • completed {} • failed {}", running, pending, completed, failed)));
+                        lines.push(Line::from(""));
+                        for a in &self.active_agents {
+                            let status = match a.status { AgentStatus::Running => "running", AgentStatus::Pending => "pending", AgentStatus::Completed => "completed", AgentStatus::Failed => "failed" };
+                            lines.push(Line::from(format!("- [{}] {}", status, a.name)));
+                        }
+                    }
+                    self.bottom_pane.show_agent_status_view(lines);
+                    return;
+                }
+            }
+        }
         // Intercept keys for diff overlay when active
         if let Some(ref mut overlay) = self.diff_overlay {
             use crossterm::event::KeyCode;
@@ -2159,6 +3212,8 @@ impl ChatWidget<'_> {
             self.last_agent_prompt = Some(original_text.clone());
         }
 
+        // No per-message consent gate; /tgm handles confirmation.
+
         // Process slash commands and expand them if needed
         let processed = crate::slash_command::process_slash_command_message(&original_text);
         match processed {
@@ -2318,6 +3373,8 @@ impl ChatWidget<'_> {
         } else {
             tracing::info!("Browser is not enabled, skipping screenshot capture");
         }
+
+        // Our /tgm and consent handling uses restart_session; keep message flow default here.
 
         if !actual_text.is_empty() {
             items.push(InputItem::Text {
@@ -2607,8 +3664,14 @@ impl ChatWidget<'_> {
                     },
                 );
             }
-            EventMsg::ExecCommandOutputDelta(_) => {
-                // TODO
+            EventMsg::ExecCommandOutputDelta(delta) => {
+                // Inspect for safety messages and surface a footer hint.
+                let text = String::from_utf8_lossy(&delta.chunk);
+                if text.contains("[safety]") {
+                    // Flash a brief hint encouraging /safety
+                    self.bottom_pane
+                        .flash_footer_notice("safety: exfil warning — try /safety".to_string());
+                }
             }
             EventMsg::PatchApplyBegin(PatchApplyBeginEvent {
                 call_id: _,
@@ -2789,6 +3852,7 @@ impl ChatWidget<'_> {
                 self.active_agents.clear();
                 for agent in agents {
                     self.active_agents.push(AgentInfo {
+                        id: agent.id.clone(),
                         name: agent.name.clone(),
                         status: match agent.status.as_str() {
                             "pending" => AgentStatus::Pending,
@@ -2797,6 +3861,14 @@ impl ChatWidget<'_> {
                             "failed" => AgentStatus::Failed,
                             _ => AgentStatus::Pending,
                         },
+                        model: agent.model.clone(),
+                        created_at: agent.created_at.clone(),
+                        started_at: agent.started_at.clone(),
+                        completed_at: agent.completed_at.clone(),
+                        error: agent.error.clone(),
+                        progress_tail: agent.progress_tail.clone(),
+                        worktree_path: agent.worktree_path.clone(),
+                        branch_name: agent.branch_name.clone(),
                     });
                 }
 
@@ -2829,7 +3901,7 @@ impl ChatWidget<'_> {
                     "planning".to_string()
                 };
 
-                // Reflect concise agent status in the input border
+                // Reflect concise agent status in the input border and footer
                 let count = self.active_agents.len();
                 let msg = match self.overall_task_status.as_str() {
                     "preparing" => format!("agents: preparing ({} ready)", count),
@@ -2839,6 +3911,50 @@ impl ChatWidget<'_> {
                     _ => "agents: planning".to_string(),
                 };
                 self.bottom_pane.update_status_text(msg);
+                // Provide a detailed payload for an active AgentStatus view
+                let payload = {
+                    let mut arr = Vec::new();
+                    for a in &self.active_agents {
+                        let status = match a.status { AgentStatus::Pending => "pending", AgentStatus::Running => "running", AgentStatus::Completed => "completed", AgentStatus::Failed => "failed" };
+                        arr.push(serde_json::json!({
+                            "id": a.id,
+                            "name": a.name,
+                            "status": status,
+                            "model": a.model,
+                            "created_at": a.created_at,
+                            "started_at": a.started_at,
+                            "completed_at": a.completed_at,
+                            "error": a.error,
+                            "progress_tail": a.progress_tail,
+                            "worktree_path": a.worktree_path,
+                            "branch_name": a.branch_name,
+                        }));
+                    }
+                    let obj = serde_json::json!({
+                        "context": self.agent_context.clone().unwrap_or_default(),
+                        "task": self.agent_task.clone().unwrap_or_default(),
+                        "agents": arr,
+                    });
+                    format!("[AGENTS]{}", obj.to_string())
+                };
+                self.bottom_pane.update_status_text(payload);
+
+                // Footer: show concise running count when applicable
+                let running = self
+                    .active_agents
+                    .iter()
+                    .filter(|a| matches!(a.status, AgentStatus::Running))
+                    .count();
+                let footer_text = if running > 0 {
+                    Some(format!("agents {} running", running))
+                } else if self.agents_ready_to_start && self.active_agents.is_empty() {
+                    Some("agents preparing".to_string())
+                } else if count > 0 {
+                    Some(format!("agents {}", count))
+                } else {
+                    None
+                };
+                self.refresh_footer_indicator(footer_text);
 
                 // Clear agents HUD when task is complete or failed
                 if matches!(self.overall_task_status.as_str(), "complete" | "failed") {
@@ -2848,6 +3964,11 @@ impl ChatWidget<'_> {
                     self.agent_task = None;
                     self.last_agent_prompt = None;
                     self.sparkline_data.borrow_mut().clear();
+                    // Refresh footer indicator (may still show approvals if pending)
+                    self.refresh_footer_indicator(None);
+                    // Also nudge any visible agent view to clear or reflect completion
+                    let payload = format!("[AGENTS]{{\"context\":\"\",\"task\":\"\",\"agents\":[]}}");
+                    self.bottom_pane.update_status_text(payload);
                 }
 
                 // Reset ready to start flag when we get actual agent updates
@@ -3148,9 +4269,244 @@ impl ChatWidget<'_> {
     }
 
     pub(crate) fn handle_memory_command(&mut self, command_args: String) {
-        // Show or set memory parameters.
+        // Show or set memory parameters, or peek into graph memory.
         let defaults = codex_core::config_types::MemoryConfig::default();
         let args = command_args.trim();
+
+        // Peek Episodes: interactive selector of prior episodes with actions to open daily summary
+        if args.eq_ignore_ascii_case("peek-episodes")
+            || args.to_lowercase().starts_with("peek episodes")
+            || args.eq_ignore_ascii_case("episodes")
+            || args.to_lowercase().starts_with("episodes ")
+        {
+            // Parse: [peek-]episodes [N] [--since YYYYMMDD]
+            let mut limit = 10usize;
+            let mut since_filter: Option<String> = None; // YYYYMMDD
+            let parts: Vec<&str> = args.split_whitespace().collect();
+            let mut i = 0usize;
+            if i < parts.len() && (parts[i].eq_ignore_ascii_case("peek-episodes") || parts[i].eq_ignore_ascii_case("episodes")) {
+                i += 1;
+            } else if i + 1 < parts.len() && parts[i].eq_ignore_ascii_case("peek") && parts[i + 1].eq_ignore_ascii_case("episodes") {
+                i += 2;
+            }
+            if i < parts.len() {
+                if let Ok(v) = parts[i].parse::<usize>() { limit = v.max(1); i += 1; }
+            }
+            while i < parts.len() {
+                match parts[i] {
+                    "--since" if i + 1 < parts.len() => {
+                        let s = parts[i + 1];
+                        if s.len() == 8 && s.chars().all(|c| c.is_ascii_digit()) {
+                            since_filter = Some(s.to_string());
+                        }
+                        i += 1;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+
+            let mut eps = match codex_memory::graph::retrieve::all_episodes(&self.config.cwd) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.add_to_history(history_cell::new_error_event(format!("Failed to read episodes: {}", e)));
+                    return;
+                }
+            };
+            if let Some(since) = &since_filter {
+                eps.retain(|e| e.ts.get(0..8) >= Some(since.as_str()));
+            }
+            eps.sort_by(|a, b| a.ts.cmp(&b.ts));
+            eps.reverse();
+            if eps.len() > limit { eps.truncate(limit); }
+
+            use crate::bottom_pane::list_selection_view::{SelectionAction, SelectionItem};
+            use crate::app_event::AppEvent;
+            use crate::slash_command::SlashCommand;
+            let mut items: Vec<SelectionItem> = Vec::new();
+
+            // Quick links to /reports views
+            {
+                let action_context: SelectionAction = Box::new(|tx| {
+                    tx.send(AppEvent::DispatchCommand(SlashCommand::Reports, "/reports context".to_string()));
+                });
+                items.push(SelectionItem { name: "Reports: By Context…".to_string(), description: Some("Browse runs by context label".to_string()), is_current: false, actions: vec![action_context] });
+                let action_trend7: SelectionAction = Box::new(|tx| {
+                    tx.send(AppEvent::DispatchCommand(SlashCommand::Reports, "/reports trends 7".to_string()));
+                });
+                items.push(SelectionItem { name: "Reports: Trends (7d)".to_string(), description: Some("Daily ok/error for recent week".to_string()), is_current: false, actions: vec![action_trend7] });
+                let action_trend30: SelectionAction = Box::new(|tx| {
+                    tx.send(AppEvent::DispatchCommand(SlashCommand::Reports, "/reports trends 30".to_string()));
+                });
+                items.push(SelectionItem { name: "Reports: Trends (30d)".to_string(), description: Some("Daily ok/error for recent month".to_string()), is_current: false, actions: vec![action_trend30] });
+            }
+
+            for e in &eps {
+                let day = e.ts.get(0..8).unwrap_or("").to_string();
+                let ts = e.ts.clone();
+                let desc = format!("research {}b • plan {}b • summary {}b", e.research_len, e.plan_len, e.summary_len);
+                let day_for_action = day.clone();
+                let action: SelectionAction = Box::new(move |tx| {
+                    tx.send(AppEvent::DispatchCommand(
+                        SlashCommand::Reports,
+                        format!("/reports {} summary", day_for_action),
+                    ));
+                });
+                items.push(SelectionItem { name: ts, description: Some(desc), is_current: false, actions: vec![action] });
+            }
+
+            if items.is_empty() {
+                items.push(SelectionItem { name: "No matching episodes".to_string(), description: None, is_current: true, actions: vec![] });
+            }
+            let mut subtitle_parts: Vec<String> = Vec::new();
+            subtitle_parts.push(format!("top {}", limit));
+            if let Some(s) = &since_filter { subtitle_parts.push(format!("since={}", s)); }
+            let subtitle = if subtitle_parts.is_empty() { None } else { Some(subtitle_parts.join("  •  ")) };
+            self.bottom_pane.show_list_selection(
+                "Graph Memory • Episodes".to_string(),
+                subtitle,
+                Some("Enter: open daily summary  •  Esc: close".to_string()),
+                items,
+            );
+            return;
+        }
+
+        // Reingest: rebuild memory graph from existing artifacts
+        if args.eq_ignore_ascii_case("reingest") {
+            self.bottom_pane.set_task_running(true);
+            self.bottom_pane.update_status_text("reingesting memory graph".to_string());
+            let cwd = self.config.cwd.clone();
+            let tx = self.app_event_tx.clone();
+            tokio::spawn(async move {
+                let res = tokio::task::spawn_blocking(move || {
+                    codex_memory::graph::ingest::reingest_repo(&cwd)
+                })
+                .await
+                .ok()
+                .unwrap_or(Ok((0, 0)))
+                .unwrap_or((0, 0));
+                let (runs, eps) = res;
+                // Push a non-blocking notice with counts
+                use ratatui::text::Line;
+                tx.send(AppEvent::InsertHistory(vec![
+                    Line::from(format!("Reingested graph: runs {} • episodes {}", runs, eps)),
+                ]));
+                // After reingest, open reports picker for discoverability
+                tx.send(AppEvent::DispatchCommand(
+                    crate::slash_command::SlashCommand::Reports,
+                    "/reports".to_string(),
+                ));
+            });
+            return;
+        }
+
+        // Peek: interactive selector of recent runs with optional filters
+        if args.eq_ignore_ascii_case("peek") || args.to_lowercase().starts_with("peek ") {
+            // Parse: peek [N] [--context LABEL] [--since YYYYMMDD]
+            let mut limit = 10usize;
+            let mut context_filter: Option<String> = None;
+            let mut since_filter: Option<String> = None; // YYYYMMDD
+            let parts: Vec<&str> = args.split_whitespace().collect();
+            let mut i = 1usize; // skip 'peek'
+            // Optional first numeric
+            if i < parts.len() {
+                if let Ok(v) = parts[i].parse::<usize>() {
+                    limit = v.max(1);
+                    i += 1;
+                }
+            }
+            while i < parts.len() {
+                match parts[i] {
+                    "--context" if i + 1 < parts.len() => {
+                        context_filter = Some(parts[i + 1].to_string());
+                        i += 1;
+                    }
+                    "--since" if i + 1 < parts.len() => {
+                        let s = parts[i + 1];
+                        if s.len() == 8 && s.chars().all(|c| c.is_ascii_digit()) {
+                            since_filter = Some(s.to_string());
+                        }
+                        i += 1;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+
+            // Load runs from graph and apply filters
+            let mut runs = match codex_memory::graph::retrieve::all_runs(&self.config.cwd) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.add_to_history(history_cell::new_error_event(format!("Failed to read runs: {}", e)));
+                    return;
+                }
+            };
+            if let Some(ctx) = &context_filter {
+                runs.retain(|r| r.context.as_deref() == Some(ctx.as_str()));
+            }
+            if let Some(since) = &since_filter {
+                runs.retain(|r| r.ts.get(0..8) >= Some(since.as_str()));
+            }
+            runs.sort_by(|a, b| a.ts.cmp(&b.ts));
+            runs.reverse();
+            if runs.len() > limit { runs.truncate(limit); }
+
+            // Build interactive list
+            use crate::bottom_pane::list_selection_view::{SelectionAction, SelectionItem};
+            use crate::app_event::AppEvent;
+            use crate::slash_command::SlashCommand;
+            let mut items: Vec<SelectionItem> = Vec::new();
+
+            // Quick links to /reports views
+            {
+                let action_context: SelectionAction = Box::new(|tx| {
+                    tx.send(AppEvent::DispatchCommand(SlashCommand::Reports, "/reports context".to_string()));
+                });
+                items.push(SelectionItem { name: "Reports: By Context…".to_string(), description: Some("Browse runs by context label".to_string()), is_current: false, actions: vec![action_context] });
+                let action_trend7: SelectionAction = Box::new(|tx| {
+                    tx.send(AppEvent::DispatchCommand(SlashCommand::Reports, "/reports trends 7".to_string()));
+                });
+                items.push(SelectionItem { name: "Reports: Trends (7d)".to_string(), description: Some("Daily ok/error for recent week".to_string()), is_current: false, actions: vec![action_trend7] });
+                let action_trend30: SelectionAction = Box::new(|tx| {
+                    tx.send(AppEvent::DispatchCommand(SlashCommand::Reports, "/reports trends 30".to_string()));
+                });
+                items.push(SelectionItem { name: "Reports: Trends (30d)".to_string(), description: Some("Daily ok/error for recent month".to_string()), is_current: false, actions: vec![action_trend30] });
+            }
+            for r in &runs {
+                let day = r.ts.get(0..8).unwrap_or("").to_string();
+                let ts = r.ts.clone();
+                let ctx_part = r.context.clone().unwrap_or_default();
+                let desc = if ctx_part.is_empty() {
+                    format!("ok {} • error {}", r.ok, r.err)
+                } else {
+                    format!("ok {} • error {} • context {}", r.ok, r.err, ctx_part)
+                };
+                let day_for_action = day.clone();
+                let ts_for_action = ts.clone();
+                let action: SelectionAction = Box::new(move |tx| {
+                    tx.send(AppEvent::DispatchCommand(
+                        SlashCommand::Reports,
+                        format!("/reports {} {}", day_for_action, ts_for_action),
+                    ));
+                });
+                items.push(SelectionItem { name: ts, description: Some(desc), is_current: false, actions: vec![action] });
+            }
+            if items.is_empty() {
+                items.push(SelectionItem { name: "No matching runs".to_string(), description: None, is_current: true, actions: vec![] });
+            }
+            let mut subtitle_parts: Vec<String> = Vec::new();
+            subtitle_parts.push(format!("top {}", limit));
+            if let Some(c) = &context_filter { subtitle_parts.push(format!("context={}", c)); }
+            if let Some(s) = &since_filter { subtitle_parts.push(format!("since={}", s)); }
+            let subtitle = if subtitle_parts.is_empty() { None } else { Some(subtitle_parts.join("  •  ")) };
+            self.bottom_pane.show_list_selection(
+                "Graph Memory • Runs".to_string(),
+                subtitle,
+                Some("Enter: open run  •  Esc: close".to_string()),
+                items,
+            );
+            return;
+        }
 
         if args.is_empty() || args.eq_ignore_ascii_case("show") {
             let cur = &self.config.memory;
@@ -3203,7 +4559,7 @@ impl ChatWidget<'_> {
         }
 
         if keep_last.is_none() && summary_chars.is_none() {
-            let msg = "Usage: /memory [show]|[keep <N>] [summary <CHARS>]".to_string();
+            let msg = "Usage: /memory [show]|[peek [N] [--context NAME] [--since YYYYMMDD]]|[peek-episodes [N] [--since YYYYMMDD]]|[reingest]|[keep <N>] [summary <CHARS>]".to_string();
             self.add_to_history(history_cell::new_error_event(msg));
             return;
         }
@@ -5104,6 +6460,196 @@ impl ChatWidget<'_> {
         
         // Request redraw for the new animation
         self.mark_needs_redraw();
+    }
+
+    /// Restart the core session with the current `self.config` so changes to
+    /// approval/sandbox policies take effect immediately.
+    fn restart_session(&mut self) {
+        // Create a fresh op channel and swap it in
+        let (codex_op_tx, mut codex_op_rx) = unbounded_channel();
+        self.codex_op_tx = codex_op_tx;
+
+        // Spawn a new conversation using the current config
+        let app_event_tx_clone = self.app_event_tx.clone();
+        let config_for_agent_loop = self.config.clone();
+        tokio::spawn(async move {
+            let conversation_manager = ConversationManager::default();
+            let new_conversation = match conversation_manager
+                .new_conversation(config_for_agent_loop)
+                .await
+            {
+                Ok(conv) => conv,
+                Err(e) => {
+                    tracing::error!("failed to initialize conversation: {e}");
+                    return;
+                }
+            };
+
+            // Forward the SessionConfigured event to the UI
+            let event = Event {
+                id: new_conversation.conversation_id.to_string(),
+                msg: EventMsg::SessionConfigured(new_conversation.session_configured),
+            };
+            app_event_tx_clone.send(AppEvent::CodexEvent(event));
+
+            let conversation = new_conversation.conversation;
+            let conversation_clone = conversation.clone();
+            tokio::spawn(async move {
+                while let Some(op) = codex_op_rx.recv().await {
+                    if let Err(e) = conversation_clone.submit(op).await {
+                        tracing::error!("failed to submit op: {e}");
+                    }
+                }
+            });
+
+            while let Ok(event) = conversation.next_event().await {
+                app_event_tx_clone.send(AppEvent::CodexEvent(event));
+            }
+        });
+    }
+
+    /// Handle `/tgm` command: on|off|status|toggle (default: toggle)
+    pub(crate) fn handle_tgm_command(&mut self, args: String) {
+        let arg = args.trim();
+
+        // Helper to detect wrapper availability for status messaging
+        let wrapper_status = || -> String {
+            let firecracker = self.config.cwd.join("sandbox").join("firecracker").join("start.sh");
+            let gvisor = self.config.cwd.join("sandbox").join("gvisor").join("run.sh");
+            if firecracker.is_file() { "firecracker".to_string() }
+            else if gvisor.is_file() { "gvisor".to_string() }
+            else { "none".to_string() }
+        };
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        match arg {
+            "on" => {
+                if matches!(self.config.sandbox_policy, codex_core::protocol::SandboxPolicy::DangerFullAccess) {
+                    lines.push(Line::from("GODMODE already enabled."));
+                } else {
+                    // Show Yes/No confirmation overlay (default selection: Yes)
+                    use crate::bottom_pane::list_selection_view::SelectionItem;
+                    use crate::app_event::AppEvent;
+                    use crate::slash_command::SlashCommand;
+                    let title = "Enable GODMODE?".to_string();
+                    let subtitle = Some(format!(
+                        "High‑privilege actions will route via {} when available."
+                        , wrapper_status()));
+                    let footer = Some("Use ↑/↓ to select · Enter to confirm · Esc to cancel".to_string());
+                    let yes = SelectionItem {
+                        name: "Yes, I’m sure".to_string(),
+                        description: Some("Enable GODMODE for this session".to_string()),
+                        is_current: true,
+                        actions: vec![Box::new(|tx| {
+                            tx.send(AppEvent::DispatchCommand(SlashCommand::Tgm, "/tgm confirm_on".to_string()));
+                        })],
+                    };
+                    let no = SelectionItem {
+                        name: "No, cancel".to_string(),
+                        description: Some("Keep current safety profile".to_string()),
+                        is_current: false,
+                        actions: vec![Box::new(|tx| {
+                            tx.send(AppEvent::DispatchCommand(SlashCommand::Tgm, "/tgm cancel".to_string()));
+                        })],
+                    };
+                    self.bottom_pane.show_list_selection(title, subtitle, footer, vec![yes, no]);
+                }
+            }
+            "confirm_on" => {
+                if matches!(self.config.sandbox_policy, codex_core::protocol::SandboxPolicy::DangerFullAccess) {
+                    lines.push(Line::from("GODMODE already enabled."));
+                } else {
+                    self.previous_sandbox_policy = Some(self.config.sandbox_policy.clone());
+                    self.previous_approval_policy = Some(self.config.approval_policy);
+                    self.config.sandbox_policy = codex_core::protocol::SandboxPolicy::DangerFullAccess;
+                    self.config.approval_policy = codex_core::protocol::AskForApproval::Never;
+
+                    // QoL: when enabling GODMODE, turn on semantic compression (memory)
+                    self.config.memory.enabled = true;
+                    self.config.memory.summarize_on_prune = true;
+                    // Reflect in the composer UI immediately
+                    self.bottom_pane.set_compression_state(true);
+                    self.bottom_pane.set_compression_hint(true);
+
+                    if let Some(py) = PolicyYaml::load_from_repo(&self.config.cwd) {
+                        let log_path = py.policy_log_path(&self.config.cwd);
+                        append_policy_log(&log_path, serde_json::json!({
+                            "ts": chrono::Utc::now().to_rfc3339(),
+                            "event": "godmode_on",
+                            "cwd": self.config.cwd,
+                        }));
+                    }
+                    lines.push(Line::from("GODMODE enabled: high‑privilege mode will run in isolation when possible."));
+                    lines.push(Line::from(format!("Wrapper: {}", wrapper_status())));
+                    self.restart_session();
+                }
+            }
+            "cancel" => {
+                lines.push(Line::from("GODMODE not enabled."));
+            }
+            "off" => {
+                if matches!(self.config.sandbox_policy, codex_core::protocol::SandboxPolicy::DangerFullAccess) {
+                    // Revert to previous policy or workspace-write by default
+                    let fallback = codex_core::protocol::SandboxPolicy::new_workspace_write_policy();
+                    let prev = self.previous_sandbox_policy.clone().unwrap_or(fallback);
+                    self.config.sandbox_policy = prev;
+                    self.previous_sandbox_policy = None;
+                    // Restore prior approval policy or default to OnRequest
+                    let prev_appr = self
+                        .previous_approval_policy
+                        .take()
+                        .unwrap_or(codex_core::protocol::AskForApproval::OnRequest);
+                    self.config.approval_policy = prev_appr;
+                    self.godmode_consent_pending = false;
+
+                    if let Some(py) = PolicyYaml::load_from_repo(&self.config.cwd) {
+                        let log_path = py.policy_log_path(&self.config.cwd);
+                        append_policy_log(&log_path, serde_json::json!({
+                            "ts": chrono::Utc::now().to_rfc3339(),
+                            "event": "godmode_off",
+                            "cwd": self.config.cwd,
+                        }));
+                    }
+
+                    lines.push(Line::from("GODMODE disabled; reverted to prior profile."));
+                    lines.push(Line::from(format!("Profile: {}", match &self.config.sandbox_policy {
+                        codex_core::protocol::SandboxPolicy::ReadOnly => "READ_ONLY",
+                        codex_core::protocol::SandboxPolicy::WorkspaceWrite { .. } => "WORKSPACE_WRITE",
+                        codex_core::protocol::SandboxPolicy::DangerFullAccess => "GODMODE",
+                    })));
+
+                    self.restart_session();
+                } else {
+                    lines.push(Line::from("GODMODE is not active."));
+                }
+            }
+            "status" => {
+                let profile = match &self.config.sandbox_policy {
+                    codex_core::protocol::SandboxPolicy::ReadOnly => "READ_ONLY",
+                    codex_core::protocol::SandboxPolicy::WorkspaceWrite { .. } => "WORKSPACE_WRITE",
+                    codex_core::protocol::SandboxPolicy::DangerFullAccess => "GODMODE",
+                };
+                let pending = if self.godmode_consent_pending { " (awaiting consent)" } else { "" };
+                lines.push(Line::from(format!("Profile: {}{}", profile, pending)));
+                lines.push(Line::from(format!("Wrapper: {}", wrapper_status())));
+            }
+            "" => {
+                // Toggle behavior when no args: if not in GODMODE, turn on; otherwise off
+                if matches!(self.config.sandbox_policy, codex_core::protocol::SandboxPolicy::DangerFullAccess) {
+                    self.handle_tgm_command("off".to_string());
+                    return;
+                } else {
+                    self.handle_tgm_command("on".to_string());
+                    return;
+                }
+            }
+            _ => {
+                lines.push(Line::from("Usage: /tgm on|off|status"));
+            }
+        }
+
+        if !lines.is_empty() { self.push_notice_lines(lines); }
+        self.request_redraw();
     }
 
     pub fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {

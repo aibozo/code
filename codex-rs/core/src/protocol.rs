@@ -820,6 +820,24 @@ pub struct AgentInfo {
     pub status: String,
     /// Optional model being used
     pub model: Option<String>,
+    /// RFC3339 timestamps for lifecycle (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    /// Optional recent error
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Optional tail of progress lines
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress_tail: Option<Vec<String>>,
+    /// Optional worktree info when available
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_name: Option<String>,
 }
 
 /// User's decision in response to an ExecApprovalRequest.

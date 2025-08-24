@@ -105,6 +105,64 @@ npm install -g @anthropic-ai/claude-code @google/gemini-cli && claude "Just chec
 /new
 ```
 
+## Self‑Improvement Harness
+
+Run the evaluation harness and the orchestrated improvement loop from the CLI. Artifacts are human‑readable and stored in‑repo.
+
+### Run the harness
+
+```bash
+# From repo root
+code harness run --seed 1337 --context my-branch
+```
+
+Outputs:
+- Results JSON: `harness/results/YYYYMMDD/<ts>.json`
+- Daily index/summary: `harness/results/YYYYMMDD/_index.json`, `_daily_summary.json`
+- Logs: `harness/artifacts/<ts>.log`
+- Cache: `harness/cache/` (hashes stage scripts + git state + seed)
+
+Flags:
+- `--seed N`: deterministic RNG seed
+- `--no-cache`: force re-run stages
+- `--context NAME`: label the run (e.g., branch, ticket)
+
+### Run an improvement cycle
+
+```bash
+# Attempt a bounded improve cycle and gate on harness deltas
+code improve "Reduce failing harness stages" --max-attempts 1 --context my-branch
+```
+
+What it does:
+- Creates an episode at `orchestrator/episodes/<ts>/`
+- Writes `assessment.md`, then runs research → plan → code attempt(s) → harness → reflection → `summary.md`
+- Accepts a run if errors decrease (Δerr ≤ 0) and passes increase (Δok ≥ 0) with no new high‑severity security failures
+
+Optional budgets:
+- `--wall-time SECS` limits total loop wall‑time
+- `--token-budget TOKENS` and `--concurrency N` are accepted but advisory in MVP
+
+### Browse artifacts
+
+- Latest results: open the newest `harness/results/YYYYMMDD/<ts>.json`
+- Day summary: `harness/results/YYYYMMDD/_daily_summary.json`
+- Episodes: `orchestrator/episodes/<ts>/` (research/plan/changes/test/summary)
+
+### Graph memory (optional)
+
+```bash
+# Ingest prior runs and episodes into the file‑backed graph
+code memory reingest
+```
+
+This populates `graph/nodes.jsonl` and `graph/edges.jsonl` for lightweight history queries.
+
+### Safety & profiles
+
+- Harness and improve respect your active sandbox profile and approvals (header shows status in the TUI).
+- Start in read‑only for exploration; switch to workspace‑write when ready to run writes.
+
 ## CLI reference
 
 ```shell

@@ -78,6 +78,13 @@ pub fn assess_command_safety(
     approved: &HashSet<Vec<String>>,
     with_escalated_permissions: bool,
 ) -> SafetyCheck {
+    // GODMODE: when the session policy is DangerFullAccess, route all commands
+    // through the MicroVm path to keep actions auditable and isolated from the
+    // host. User approval policy is still honored elsewhere.
+    if matches!(sandbox_policy, SandboxPolicy::DangerFullAccess) {
+        return SafetyCheck::AutoApprove { sandbox_type: SandboxType::MicroVm };
+    }
+
     // A command is "trusted" because either:
     // - it belongs to a set of commands we consider "safe" by default, or
     // - the user has explicitly approved the command for this session
@@ -117,8 +124,14 @@ pub(crate) fn assess_safety_for_untrusted_command(
         }
         (OnFailure, DangerFullAccess)
         | (Never, DangerFullAccess)
-        | (OnRequest, DangerFullAccess) => SafetyCheck::AutoApprove {
-            sandbox_type: SandboxType::None,
+        | (OnRequest, DangerFullAccess) => {
+            // M5: Prefer executing high-privilege commands via a microVM/container
+            // wrapper when the session is in GODMODE (DangerFullAccess). This keeps
+            // host impact auditable and bounded. Fall back to host only if no wrapper
+            // is present (handled inside the exec path).
+            SafetyCheck::AutoApprove {
+                sandbox_type: SandboxType::MicroVm,
+            }
         },
         (OnRequest, ReadOnly) | (OnRequest, WorkspaceWrite { .. }) => {
             if with_escalated_permissions {

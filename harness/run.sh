@@ -4,14 +4,21 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 OUT_DIR="$ROOT_DIR/harness/results"
 ART_DIR="$ROOT_DIR/harness/artifacts"
+CACHE_DIR="$ROOT_DIR/harness/cache"
 SCHEMA_VER="v1"
-mkdir -p "$OUT_DIR" "$ART_DIR"
+mkdir -p "$OUT_DIR" "$ART_DIR" "$CACHE_DIR"
 
 SEED=1337
+NO_CACHE=0
+CONTEXT=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --seed)
       SEED="$2"; shift 2 ;;
+    --no-cache|--force)
+      NO_CACHE=1; shift ;;
+    --context)
+      CONTEXT="$2"; shift 2 ;;
     *) echo "Unknown arg: $1"; exit 2;;
   esac
 done
@@ -23,7 +30,12 @@ day_dir="$OUT_DIR/$day"
 mkdir -p "$day_dir"
 out_json="$day_dir/$ts.json"
 
-echo "[harness] Starting harness run at $ts (seed=$SEED)" | tee "$log_file"
+echo "[harness] Starting harness run at $ts (seed=$SEED, cache=$((1-NO_CACHE)))" | tee "$log_file"
+
+# Workspace key for cache invalidation
+HEAD_HASH=$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || echo nogit)
+DIRTY_HASH=$(git -C "$ROOT_DIR" status --porcelain 2>/dev/null | sha1sum | awk '{print $1}')
+WS_KEY="$HEAD_HASH-$DIRTY_HASH"
 
 run_stage() {
   local name="$1"; shift
@@ -32,6 +44,33 @@ run_stage() {
   echo "[harness] stage=$name cmd=${cmd[*]}" >> "$log_file"
   local status="ok"
   local metrics='{}'
+  # Stage-specific script version
+  local stage_script="$ROOT_DIR/harness/stages/$name.sh"
+  local stage_ver
+  stage_ver=$(sha1sum "$stage_script" 2>/dev/null | awk '{print $1}')
+  local cache_key="$stage_ver|$name|$WS_KEY|$SEED"
+  local cache_file="$CACHE_DIR/$name.json"
+  if [[ $NO_CACHE -eq 0 ]] && [[ -f "$cache_file" ]] && grep -q "$cache_key" "$cache_file" 2>/dev/null; then
+    echo "[harness] cache hit for $name" >> "$log_file"
+    if command -v python3 >/dev/null 2>&1; then
+      read_status_and_metrics=$(python3 - "$cache_file" <<'PY'
+import json,sys
+path=sys.argv[1]
+with open(path,'r') as f:
+    obj=json.load(f)
+st=obj.get('status','ok')
+mx=obj.get('metrics',{})
+print(st)
+print(json.dumps(mx))
+PY
+)
+      status=$(printf "%s" "$read_status_and_metrics" | sed -n '1p')
+      metrics=$(printf "%s" "$read_status_and_metrics" | sed -n '2p')
+      printf '{"name":"%s","status":"%s","metrics":%s,"cached":true}' "$name" "$status" "$metrics"
+      return
+    fi
+  fi
+
   if output=$("${cmd[@]}" 2>>"$log_file"); then
     # Accept either JSON or empty
     if [[ -n "$output" ]]; then
@@ -40,7 +79,18 @@ run_stage() {
   else
     status="error"
   fi
-  printf '{"name":"%s","status":"%s","metrics":%s}' "$name" "$status" "$metrics"
+  # Store cache
+  echo "[harness] cache store for $name" >> "$log_file"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$cache_file" <<PY
+import json,sys
+path=sys.argv[1]
+obj={"cache_key": "$cache_key", "status": "$status", "metrics": $metrics}
+with open(path,'w') as f:
+    json.dump(obj,f)
+PY
+  fi
+  printf '{"name":"%s","status":"%s","metrics":%s,"cached":false}' "$name" "$status" "$metrics"
 }
 
 stages_json="["
@@ -59,11 +109,17 @@ fi
 stages_json+=","$(printf '{"name":"%s","status":"%s","metrics":%s}' swebench ok "$swe")
 stages_json+="]"
 
+# Optional context key
+CONTEXT_JSON=""
+if [[ -n "$CONTEXT" ]]; then
+  CONTEXT_JSON=",\n  \"context\": \"$CONTEXT\""
+fi
+
 cat > "$out_json" <<JSON
 {
   "version": "$SCHEMA_VER",
   "timestamp": "$ts",
-  "seed": $SEED,
+  "seed": $SEED$CONTEXT_JSON,
   "stages": $stages_json
 }
 JSON
@@ -109,20 +165,25 @@ for tsname in sorted(run_names):
     if not obj:
         continue
     ok = err = 0
+    cached = 0
     for st in obj.get('stages', []) or []:
         status = st.get('status')
         if status == 'ok':
             ok += 1
         elif status == 'error':
             err += 1
+        if st.get('cached'):
+            cached += 1
     runs.append({
         "ts": obj.get("timestamp", tsname),
         "ok": ok,
         "error": err,
+        "cached": cached,
     })
 
 total_ok = sum(r['ok'] for r in runs)
 total_err = sum(r['error'] for r in runs)
+total_cached = sum(r.get('cached', 0) for r in runs)
 improved = 0
 for i in range(1, len(runs)):
     prev = runs[i-1]
@@ -135,6 +196,7 @@ summary = {
     "runs_count": len(runs),
     "total_ok": total_ok,
     "total_error": total_err,
+    "total_cached": total_cached,
     "improved_runs": improved,
     "runs": runs,
     "updated_at": ts,

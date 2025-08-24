@@ -7,6 +7,7 @@ use crate::models::ResponseItem;
 use crate::protocol::AskForApproval;
 use crate::protocol::SandboxPolicy;
 use crate::shell::Shell;
+use crate::policy_yaml::PolicyYaml;
 use codex_protocol::config_types::SandboxMode;
 use std::path::PathBuf;
 
@@ -29,6 +30,12 @@ pub(crate) struct EnvironmentContext {
     pub sandbox_mode: Option<SandboxMode>,
     pub network_access: Option<NetworkAccess>,
     pub shell: Option<Shell>,
+    /// Active policy level from configs/policy.yaml (e.g., READ_ONLY, WORKSPACE_WRITE, GODMODE)
+    pub policy_level: Option<String>,
+    /// Isolation wrapper availability: "firecracker", "gvisor", or "none".
+    pub wrapper: Option<String>,
+    /// Location where orchestration artifacts are stored.
+    pub artifacts_root: Option<PathBuf>,
 }
 
 impl EnvironmentContext {
@@ -38,6 +45,27 @@ impl EnvironmentContext {
         sandbox_policy: Option<SandboxPolicy>,
         shell: Option<Shell>,
     ) -> Self {
+        // Derive policy level from configs/policy.yaml if available
+        let policy_level = cwd
+            .as_ref()
+            .and_then(|p| PolicyYaml::load_from_repo(p))
+            .and_then(|py| py.active_level().map(|s| s.to_string()));
+
+        // Determine wrapper availability from project path
+        let wrapper = cwd.as_ref().map(|p| {
+            let firecracker = p.join("sandbox").join("firecracker").join("start.sh");
+            let gvisor = p.join("sandbox").join("gvisor").join("run.sh");
+            if firecracker.is_file() {
+                "firecracker".to_string()
+            } else if gvisor.is_file() {
+                "gvisor".to_string()
+            } else {
+                "none".to_string()
+            }
+        });
+
+        let artifacts_root = cwd.as_ref().map(|p| p.join("orchestrator").join("episodes"));
+
         Self {
             cwd,
             approval_policy,
@@ -60,6 +88,9 @@ impl EnvironmentContext {
                 None => None,
             },
             shell,
+            policy_level,
+            wrapper,
+            artifacts_root,
         }
     }
 }
@@ -102,6 +133,15 @@ impl EnvironmentContext {
             && let Some(shell_name) = shell.name()
         {
             lines.push(format!("  <shell>{}</shell>", shell_name));
+        }
+        if let Some(level) = &self.policy_level {
+            lines.push(format!("  <policy_level>{}</policy_level>", level));
+        }
+        if let Some(wrapper) = &self.wrapper {
+            lines.push(format!("  <wrapper>{}</wrapper>", wrapper));
+        }
+        if let Some(root) = &self.artifacts_root {
+            lines.push(format!("  <artifacts_root>{}</artifacts_root>", root.display()));
         }
         lines.push(ENVIRONMENT_CONTEXT_END.to_string());
         lines.join("\n")

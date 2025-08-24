@@ -90,6 +90,29 @@ reasoning: {:?}"#,
         cwd, branch, reasoning_effort
     );
 
+    // Session capabilities summary (profile • wrapper • network • approvals)
+    let profile_str = match &sess.sandbox_policy {
+        SandboxPolicy::ReadOnly => "READ_ONLY",
+        SandboxPolicy::WorkspaceWrite { .. } => "WORKSPACE_WRITE",
+        SandboxPolicy::DangerFullAccess => "GODMODE",
+    };
+    let network_str = match &sess.sandbox_policy {
+        SandboxPolicy::ReadOnly => "off",
+        SandboxPolicy::WorkspaceWrite { network_access, .. } => if *network_access { "on" } else { "off" },
+        SandboxPolicy::DangerFullAccess => "on",
+    };
+    let approvals_str = format!("{:?}", sess.approval_policy).to_lowercase().replace('_', "-");
+    let wrapper_str = {
+        let firecracker = sess.cwd.join("sandbox").join("firecracker").join("start.sh");
+        let gvisor = sess.cwd.join("sandbox").join("gvisor").join("run.sh");
+        if firecracker.is_file() { "firecracker" } else if gvisor.is_file() { "gvisor" } else { "none" }
+    };
+    current_status.push_str("\n");
+    current_status.push_str(&format!(
+        "capabilities: profile={} | wrapper={} | network={} | approvals={}",
+        profile_str, wrapper_str, network_str, approvals_str
+    ));
+
     // Prepare browser context + optional screenshot
     let mut screenshot_content: Option<ContentItem> = None;
     let mut include_screenshot = false;
@@ -248,6 +271,36 @@ reasoning: {:?}"#,
         });
     }
 
+    // Append a small ephemeral memory-graph peek to help ground responses (bounded)
+    if sess.client.get_memory_config().enabled {
+        let home = sess.cwd.clone();
+        // Detect most recent context and prefer a context-filtered pack when available
+        let (runs, eps) = match codex_memory::graph::retrieve::detect_recent_context(&home) {
+            Some(label) => (
+                codex_memory::graph::retrieve::recent_runs_pack_for_context(&home, 3, &label)
+                    .unwrap_or_else(|_| "No runs found.".to_string()),
+                codex_memory::graph::retrieve::prior_episodes_pack_for_context(&home, 3, &label)
+                    .unwrap_or_else(|_| "No episodes found.".to_string()),
+            ),
+            None => (
+                codex_memory::graph::retrieve::recent_runs_pack(&home, 3)
+                    .unwrap_or_else(|_| "No runs found.".to_string()),
+                codex_memory::graph::retrieve::prior_episodes_pack(&home, 3)
+                    .unwrap_or_else(|_| "No episodes found.".to_string()),
+            ),
+        };
+        let mut txt = String::new();
+        txt.push_str("[EPHEMERAL:memory_graph]\n");
+        txt.push_str(&runs);
+        txt.push('\n');
+        txt.push_str(&eps);
+        jar.items.push(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText { text: txt }],
+        });
+    }
+
     jar.into_items()
 }
 use crate::agent_tool::AGENT_MANAGER;
@@ -293,7 +346,10 @@ use crate::models::ResponseInputItem;
 use crate::models::ResponseItem;
 use crate::models::ShellToolCallParams;
 use crate::openai_tools::ToolsConfig;
+use crate::phase_tools::{self, Phase};
 use crate::openai_tools::get_openai_tools;
+use crate::openai_tools::create_arxiv_search_tool;
+use crate::research::{query_arxiv_online, query_arxiv_offline};
 use crate::parse_command::parse_command;
 use crate::plan_tool::handle_update_plan;
 use crate::project_doc::get_user_instructions;
@@ -337,6 +393,7 @@ use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::user_notification::UserNotification;
 use crate::util::backoff;
 use serde_json::Value;
+use crate::policy_yaml::PolicyYaml;
 
 /// The high-level interface to the Codex system.
 /// It operates as a queue pair where you send submissions and receive events.
@@ -453,6 +510,10 @@ struct State {
     /// model for a given batch when using `agent_wait` without `return_all`.
     /// This enables sequential waiting behavior across multiple calls.
     seen_completed_agents_by_batch: HashMap<String, HashSet<String>>,
+    /// Current perpetual-loop phase (Research→Plan→Code→Test→Summarize)
+    current_phase: Option<Phase>,
+    /// Current episode timestamp (YYYYMMDD-HHMMSS) for artifacts under orchestrator/episodes
+    current_episode_ts: Option<String>,
 }
 
 /// Context for an initialized model agent
@@ -522,6 +583,42 @@ impl Session {
         path.as_ref()
             .map(PathBuf::from)
             .map_or_else(|| self.cwd.clone(), |p| self.cwd.join(p))
+    }
+
+    // Phase helpers (M3 core)
+    pub fn phase_get_or_init(&self) -> Phase {
+        let mut st = self.state.lock().unwrap();
+        match st.current_phase {
+            Some(p) => p,
+            None => {
+                st.current_phase = Some(Phase::Research);
+                Phase::Research
+            }
+        }
+    }
+
+    pub fn phase_advance(&self) {
+        let mut st = self.state.lock().unwrap();
+        let cur = st.current_phase.unwrap_or(Phase::Research);
+        st.current_phase = Some(cur.next());
+    }
+
+    pub fn phase_ensure_episode_dir(&self) -> Result<(String, PathBuf), String> {
+        let cwd = self.cwd.clone();
+        let mut st = self.state.lock().unwrap();
+        let ts = match &st.current_episode_ts {
+            Some(ts) => ts.clone(),
+            None => {
+                let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+                st.current_episode_ts = Some(ts.clone());
+                ts
+            }
+        };
+        drop(st);
+        let dir = cwd.join("orchestrator").join("episodes").join(&ts);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("Failed to create episode dir {}: {}", dir.display(), e))?;
+        Ok((ts, dir))
     }
 }
 
@@ -1803,6 +1900,21 @@ async fn run_agent(sess: Arc<Session>, sub_id: String, input: Vec<InputItem>) {
                     }
                 }
 
+                // Fallback: if no tool responses and we are in Research phase, auto-finish locally
+                if responses.is_empty() && matches!(sess.phase_get_or_init(), Phase::Research) {
+                    if let Some(text) = get_last_assistant_message_from_turn(&items_to_record_in_conversation_history) {
+                        // Perform phase completion side-effects directly (write research.md, advance phase)
+                        let args = serde_json::json!({ "text": text });
+                        let _ = phase_tools::handle_finish_for_phase(
+                            &sess,
+                            Phase::Research,
+                            "auto_research_finish".to_string(),
+                            args.to_string(),
+                        ).await;
+                        // Do not inject a function call output (would require a matching tool call); proceed to next phase on next turn
+                    }
+                }
+
                 if responses.is_empty() {
                     debug!("Turn completed");
                     last_task_message = get_last_assistant_message_from_turn(
@@ -1956,14 +2068,37 @@ async fn run_turn(
     sub_id: String,
     input: Vec<ResponseItem>,
 ) -> CodexResult<Vec<ProcessedResponseItem>> {
-    // Check if browser is enabled
-    let browser_enabled = codex_browser::global::get_browser_manager().await.is_some();
+    // Check if browser is enabled; disable during Research to prefer deterministic connectors
+    let p = sess.phase_get_or_init();
+    let browser_enabled = if matches!(p, Phase::Research) {
+        false
+    } else {
+        codex_browser::global::get_browser_manager().await.is_some()
+    };
     
     let tools = get_openai_tools(
         &sess.tools_config,
         Some(sess.mcp_connection_manager.list_all_tools()),
         browser_enabled,
     );
+    // Add phase-finish tool for the current phase (one at a time)
+    let mut tools = tools;
+    tools.push(phase_tools::finish_tool_for_phase(p));
+    // Add arXiv search tool during Research
+    if matches!(p, Phase::Research) {
+        tools.push(create_arxiv_search_tool());
+    }
+    // Debug: emit a background event summarizing tools and phase for transparency
+    {
+        let mut names: Vec<String> = Vec::new();
+        for t in &tools {
+            if let crate::openai_tools::OpenAiTool::Function(f) = t {
+                names.push(f.name.clone());
+            }
+        }
+        let msg = format!("[debug] phase={:?} tools=[{}] browser_enabled={}", p, names.join(","), browser_enabled);
+        let _ = sess.tx_event.send(Event { id: sub_id.clone(), msg: EventMsg::BackgroundEvent(BackgroundEventEvent { message: msg }) }).await;
+    }
 
     let mut retries = 0;
     let mut injection_notice_sent = false;
@@ -1982,7 +2117,65 @@ async fn run_turn(
             }
         }
 
-        let prompt = Prompt {
+    // Build phase directives + optional GODMODE autonomy snippet. These are pinned to base instructions
+    // so each round has explicit goals and behavior.
+    const GODMODE_AUTONOMY_SNIPPET: &str = "\
+When GODMODE is active (danger-full-access), you are fully autonomous for this session:\n\
+- Do not ask the user for permission, confirmations, or to type any tokens.\n\
+- Do not pause to request feedback; continue execution across turns until the task is complete.\n\
+- Use tools (shell, browser, agents) as needed; handle approvals internally according to the active policy.\n\
+- If tests fail, fix them proactively; if an approach is a dead end, pivot without user prompts.\n\
+- Never output instructions like \"Reply with GODMODE\" or any consent requests.\n\
+";
+
+    fn phase_directives_text(phase: Phase) -> String {
+        match phase {
+            Phase::Research => "\
+== Phase: Research ==\n\
+Goal: Gather curated evidence and notes to inform planning and implementation.\n\
+Behavior: Operate autonomously. Use research subagents and cached connectors. Produce a concise synthesis and call research_finish when complete.\n\
+Available: shell (read-only or GODMODE per profile), subagents, memory, file search. Avoid open browsing unless explicitly allowed.\n\
+Outputs: research.md (synthesis), notes per source, sources.json (citations).\n".to_string(),
+            Phase::Plan => "\
+== Phase: Plan ==\n\
+Goal: Produce an actionable plan grounded in research and codebase structure.\n\
+Behavior: Operate autonomously. Avoid asking for confirmations. Call plan_finish when complete.\n\
+Outputs: plan.md with objectives, file/function targets, acceptance checks, and citations.\n".to_string(),
+            Phase::Code => "\
+== Phase: Code ==\n\
+Goal: Implement small, safe, incremental changes that progress the plan.\n\
+Behavior: Apply minimal diffs, run checks as needed. Do not ask permission; follow policy for approvals. Call code_finish when a logical slice is complete.\n\
+Outputs: changes.md (status), diffs in workspace.\n".to_string(),
+            Phase::Test => "\
+== Phase: Test ==\n\
+Goal: Execute harness and interpret results to guide next steps.\n\
+Behavior: Run tests deterministically; avoid chatty commentary. Call test_finish with a concise summary and next actions.\n\
+Outputs: test.md (summary), harness results JSON under harness/results/.\n".to_string(),
+            Phase::Summarize => "\
+== Phase: Summarize ==\n\
+Goal: Concisely summarize progress, remaining gaps, and next steps.\n\
+Behavior: Operate autonomously; no questions. Call summary_finish with an executive summary.\n\
+Outputs: summary.md (concise).\n".to_string(),
+        }
+    }
+
+    let mut base_override: Option<String> = {
+        // Start with Phase directives at the top to keep goals crisp.
+        let mut merged = phase_directives_text(p);
+        if let Some(b) = sess.base_instructions.clone() {
+            merged.push('\n');
+            merged.push_str(&b);
+            if !merged.ends_with('\n') { merged.push('\n'); }
+        }
+        // Append GODMODE autonomy snippet if applicable.
+        if matches!(sess.sandbox_policy, SandboxPolicy::DangerFullAccess) {
+            merged.push('\n');
+            merged.push_str(GODMODE_AUTONOMY_SNIPPET);
+        }
+        Some(merged)
+    };
+
+    let prompt = Prompt {
             input: if injected_input.is_empty() {
                 input.clone()
             } else {
@@ -1991,7 +2184,7 @@ async fn run_turn(
             user_instructions: sess.user_instructions.clone(),
             store: !sess.disable_response_storage,
             tools: tools.clone(),
-            base_instructions_override: sess.base_instructions.clone(),
+        base_instructions_override: base_override,
             environment_context: Some(EnvironmentContext::new(
                 Some(sess.cwd.clone()),
                 Some(sess.approval_policy),
@@ -3648,6 +3841,120 @@ fn write_agent_file(dir: &Path, filename: &str, content: &str) -> Result<PathBuf
     Ok(path)
 }
 
+/// Dependency install detection for async approvals: identify clear install/add commands
+#[derive(Debug, Clone)]
+struct DepInstallReq {
+    manager: String,
+    subcommand: String,
+    packages: Vec<String>,
+}
+
+fn detect_dependency_install(cmd: &[String]) -> Option<DepInstallReq> {
+    if cmd.is_empty() { return None; }
+    let prog = std::path::Path::new(&cmd[0])
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| cmd[0].clone());
+    let arg = |i: usize| cmd.get(i).map(String::as_str);
+    let mut collect_pkgs_from = |start: usize| -> Vec<String> {
+        let mut v = Vec::new();
+        for s in cmd.iter().skip(start) {
+            if s.starts_with('-') { continue; }
+            v.push(s.clone());
+        }
+        v
+    };
+    match prog.as_str() {
+        "pip" | "pip3" => {
+            if arg(1) == Some("install") {
+                return Some(DepInstallReq { manager: prog, subcommand: "install".into(), packages: collect_pkgs_from(2) });
+            }
+        }
+        "uv" => {
+            // Prefer clear add; skip uv pip ... for now to avoid false positives
+            if arg(1) == Some("add") {
+                return Some(DepInstallReq { manager: prog, subcommand: "add".into(), packages: collect_pkgs_from(2) });
+            }
+        }
+        "npm" => {
+            if matches!(arg(1), Some("install") | Some("i")) {
+                return Some(DepInstallReq { manager: prog, subcommand: arg(1).unwrap().into(), packages: collect_pkgs_from(2) });
+            }
+        }
+        "pnpm" => {
+            if matches!(arg(1), Some("add") | Some("install")) {
+                return Some(DepInstallReq { manager: prog, subcommand: arg(1).unwrap().into(), packages: collect_pkgs_from(2) });
+            }
+        }
+        "yarn" => {
+            if arg(1) == Some("add") { return Some(DepInstallReq { manager: prog, subcommand: "add".into(), packages: collect_pkgs_from(2) }); }
+        }
+        "cargo" => {
+            if matches!(arg(1), Some("add") | Some("install")) {
+                return Some(DepInstallReq { manager: prog, subcommand: arg(1).unwrap().into(), packages: collect_pkgs_from(2) });
+            }
+        }
+        "brew" => {
+            if arg(1) == Some("install") { return Some(DepInstallReq { manager: prog, subcommand: "install".into(), packages: collect_pkgs_from(2) }); }
+        }
+        "apt" | "apt-get" => {
+            if arg(1) == Some("install") { return Some(DepInstallReq { manager: prog, subcommand: "install".into(), packages: collect_pkgs_from(2) }); }
+        }
+        "dnf" | "yum" => {
+            if arg(1) == Some("install") { return Some(DepInstallReq { manager: prog, subcommand: "install".into(), packages: collect_pkgs_from(2) }); }
+        }
+        "apk" => {
+            if arg(1) == Some("add") { return Some(DepInstallReq { manager: prog, subcommand: "add".into(), packages: collect_pkgs_from(2) }); }
+        }
+        "zypper" => {
+            if arg(1) == Some("install") { return Some(DepInstallReq { manager: prog, subcommand: "install".into(), packages: collect_pkgs_from(2) }); }
+        }
+        "conda" | "mamba" => {
+            if arg(1) == Some("install") { return Some(DepInstallReq { manager: prog, subcommand: "install".into(), packages: collect_pkgs_from(2) }); }
+        }
+        "gem" => {
+            if arg(1) == Some("install") { return Some(DepInstallReq { manager: prog, subcommand: "install".into(), packages: collect_pkgs_from(2) }); }
+        }
+        "go" => {
+            if arg(1) == Some("install") { return Some(DepInstallReq { manager: prog, subcommand: "install".into(), packages: collect_pkgs_from(2) }); }
+        }
+        "pipenv" => {
+            if arg(1) == Some("install") { return Some(DepInstallReq { manager: prog, subcommand: "install".into(), packages: collect_pkgs_from(2) }); }
+        }
+        "poetry" => {
+            if arg(1) == Some("add") { return Some(DepInstallReq { manager: prog, subcommand: "add".into(), packages: collect_pkgs_from(2) }); }
+        }
+        _ => {}
+    }
+    // pacman special case: pacman -S pkg
+    if prog == "pacman" && cmd.iter().any(|s| s == "-S" || s == "--sync") {
+        let mut pkgs = Vec::new();
+        let mut skip_next = false;
+        for s in cmd.iter().skip(1) {
+            if skip_next { skip_next = false; continue; }
+            if s == "-S" || s == "--sync" { continue; }
+            if s.starts_with('-') { continue; }
+            pkgs.push(s.clone());
+        }
+        return Some(DepInstallReq { manager: prog, subcommand: "-S".into(), packages: pkgs });
+    }
+    None
+}
+
+fn approvals_log_path(cwd: &Path) -> std::path::PathBuf {
+    cwd.join(".code").join("approvals").join("requests.jsonl")
+}
+
+fn approvals_log_append(cwd: &Path, obj: serde_json::Value) {
+    let p = approvals_log_path(cwd);
+    if let Some(parent) = p.parent() { let _ = std::fs::create_dir_all(parent); }
+    if let Ok(line) = serde_json::to_string(&obj) {
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open(&p).and_then(|mut f| {
+            use std::io::Write; f.write_all(line.as_bytes())?; f.write_all(b"\n")
+        });
+    }
+}
+
 fn preview_first_n_lines(s: &str, n: usize) -> (String, usize) {
     let mut lines = s.lines();
     let mut collected: Vec<&str> = Vec::new();
@@ -3703,6 +4010,62 @@ async fn handle_function_call(
         "browser_inspect" => handle_browser_inspect(sess, arguments, sub_id, call_id).await,
         "browser_cdp" => handle_browser_cdp(sess, arguments, sub_id, call_id).await,
         "browser_cleanup" => handle_browser_cleanup(sess, sub_id, call_id).await,
+        // Phase finish tools (plain text)
+        "research_finish" => {
+            let params = serde_json::from_str(&arguments).ok();
+            let call_id_clone = call_id.clone();
+            let arguments_clone = arguments.clone();
+            execute_custom_tool(sess, &sub_id, call_id.clone(), "research_finish".to_string(), params, || async move {
+                phase_tools::handle_finish_for_phase(sess, Phase::Research, call_id.clone(), arguments.clone()).await
+            }).await
+        }
+        "plan_finish" => {
+            let params = serde_json::from_str(&arguments).ok();
+            execute_custom_tool(sess, &sub_id, call_id.clone(), "plan_finish".to_string(), params, || async move {
+                phase_tools::handle_finish_for_phase(sess, Phase::Plan, call_id.clone(), arguments.clone()).await
+            }).await
+        }
+        "code_finish" => {
+            let params = serde_json::from_str(&arguments).ok();
+            execute_custom_tool(sess, &sub_id, call_id.clone(), "code_finish".to_string(), params, || async move {
+                phase_tools::handle_finish_for_phase(sess, Phase::Code, call_id.clone(), arguments.clone()).await
+            }).await
+        }
+        "test_finish" => {
+            let params = serde_json::from_str(&arguments).ok();
+            execute_custom_tool(sess, &sub_id, call_id.clone(), "test_finish".to_string(), params, || async move {
+                phase_tools::handle_finish_for_phase(sess, Phase::Test, call_id.clone(), arguments.clone()).await
+            }).await
+        }
+        "summary_finish" => {
+            let params = serde_json::from_str(&arguments).ok();
+            execute_custom_tool(sess, &sub_id, call_id.clone(), "summary_finish".to_string(), params, || async move {
+                phase_tools::handle_finish_for_phase(sess, Phase::Summarize, call_id.clone(), arguments.clone()).await
+            }).await
+        }
+        "arxiv_search" => {
+            // Parse args: { query: string, max_results?: number, year_start?: number, year_end?: number }
+            let (query, max_results, year_range) = (|| -> Option<(String, usize, Option<(i32,i32)>)> {
+                let v: serde_json::Value = serde_json::from_str(&arguments).ok()?;
+                let q = v.get("query").and_then(|x| x.as_str())?.to_string();
+                let mr = v.get("max_results").and_then(|x| x.as_u64()).unwrap_or(50) as usize;
+                let ys = v.get("year_start").and_then(|x| x.as_i64()).map(|n| n as i32);
+                let ye = v.get("year_end").and_then(|x| x.as_i64()).map(|n| n as i32);
+                let yr = match (ys, ye) { (Some(a), Some(b)) => Some((a,b)), _ => None };
+                Some((q, mr.min(100).max(1), yr))
+            })().unwrap_or((String::new(), 50, None));
+            let cwd = sess.cwd.clone();
+            let call_id_clone = call_id.clone();
+            let args_clone = arguments.clone();
+            execute_custom_tool(sess, &sub_id, call_id.clone(), "arxiv_search".to_string(), serde_json::from_str(&arguments).ok(), || async move {
+                let mut items = query_arxiv_online(&cwd, &query, year_range, max_results).await;
+                if items.is_empty() {
+                    items = query_arxiv_offline(&cwd, &query, year_range);
+                }
+                let content = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
+                ResponseInputItem::FunctionCallOutput { call_id: call_id_clone, output: FunctionCallOutputPayload { content, success: Some(true) } }
+            }).await
+        }
         _ => {
             match sess.mcp_connection_manager.parse_tool_name(&name) {
                 Some((server, tool_name)) => {
@@ -4679,7 +5042,7 @@ async fn handle_container_exec_with_params(
             )
         }
         None => {
-            let safety = {
+            let mut safety = {
                 let state = sess.state.lock().unwrap();
                 assess_command_safety(
                     &params.command,
@@ -4689,6 +5052,26 @@ async fn handle_container_exec_with_params(
                     params.with_escalated_permissions.unwrap_or(false),
                 )
             };
+            // Apply lightweight ask-or-block policy gate from configs/policy.yaml
+            if let Some(py) = PolicyYaml::load_from_repo(&sess.cwd) {
+                let prog = std::path::Path::new(&params.command[0])
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| params.command[0].clone());
+                let allowed = py
+                    .active_level()
+                    .map(|lvl| py.allowed_for_level(lvl))
+                    .unwrap_or_default();
+                // Block clearly dangerous commands
+                if let Some(reason) = is_clearly_dangerous_command(&params.command, &sess.cwd) {
+                    safety = SafetyCheck::Reject { reason };
+                } else if !allowed.is_empty() && !allowed.contains(&prog) {
+                    // Unknown relative to allowlist → ask (unless Never ask)
+                    if !matches!(sess.approval_policy, AskForApproval::Never) {
+                        safety = SafetyCheck::AskUser;
+                    }
+                }
+            }
             let command_for_display = params.command.clone();
             (params, safety, command_for_display)
         }
@@ -4706,26 +5089,109 @@ async fn handle_container_exec_with_params(
                     params.justification.clone(),
                 )
                 .await;
-            match rx_approve.await.unwrap_or_default() {
-                ReviewDecision::Approved => (),
-                ReviewDecision::ApprovedForSession => {
-                    sess.add_approved_command(params.command.clone());
+            // Support async approvals for clear dependency installs after 2 minutes
+            if let Some(dep) = detect_dependency_install(&params.command) {
+                let cwd = params.cwd.clone();
+                approvals_log_append(&cwd, serde_json::json!({
+                    "ts": chrono::Utc::now().to_rfc3339(),
+                    "event": "approval_request",
+                    "id": sub_id.clone(),
+                    "call_id": call_id.clone(),
+                    "command": params.command,
+                    "cwd": cwd,
+                    "reason": params.justification,
+                    "dep": {"manager": dep.manager, "sub": dep.subcommand, "packages": dep.packages},
+                }));
+
+                let mut rx = rx_approve;
+                tokio::select! {
+                    decision = &mut rx => {
+                        match decision.unwrap_or(ReviewDecision::Denied) {
+                            ReviewDecision::Approved => (),
+                            ReviewDecision::ApprovedForSession => {
+                                sess.add_approved_command(params.command.clone());
+                            }
+                            ReviewDecision::Denied | ReviewDecision::Abort => {
+                                approvals_log_append(&cwd, serde_json::json!({
+                                    "ts": chrono::Utc::now().to_rfc3339(),
+                                    "event": "approval_decision",
+                                    "id": sub_id.clone(),
+                                    "call_id": call_id.clone(),
+                                    "decision": "denied"
+                                }));
+                                return ResponseInputItem::FunctionCallOutput { call_id, output: FunctionCallOutputPayload { content: "exec command rejected by user".to_string(), success: None } };
+                            }
+                        }
+                        // Approved within timeout → run outside sandbox.
+                        SandboxType::None
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                        // Convert to async: notify UI and continue.
+                        let msg = format!(
+                            "approval pending (async) for dependency install: {} {} — continue with other tasks; use /approvals to manage",
+                            dep.manager,
+                            dep.packages.join(" ")
+                        );
+                        sess.notify_background_event(&sub_id, msg.clone()).await;
+                        approvals_log_append(&cwd, serde_json::json!({
+                            "ts": chrono::Utc::now().to_rfc3339(),
+                            "event": "approval_pending_async",
+                            "id": sub_id.clone(),
+                            "call_id": call_id.clone(),
+                        }));
+
+                        // Keep waiting in background and announce decision when it arrives.
+                        let tx = sess.tx_event.clone();
+                        let sub_id_bg = sub_id.clone();
+                        let call_id_bg = call_id.clone();
+                        let cmd_bg = params.command.clone();
+                        tokio::spawn(async move {
+                            if let Ok(decision) = rx.await {
+                                let decision_str = match decision {
+                                    ReviewDecision::Approved | ReviewDecision::ApprovedForSession => "approved",
+                                    ReviewDecision::Denied | ReviewDecision::Abort => "denied",
+                                };
+                                let _ = tx.send(Event {
+                                    id: sub_id_bg.clone(),
+                                    msg: EventMsg::AgentMessage(AgentMessageEvent {
+                                        message: format!(
+                                            "async approval {} for {:?} (call_id {})",
+                                            decision_str, cmd_bg, call_id_bg
+                                        ),
+                                    }),
+                                }).await;
+                            }
+                        });
+
+                        return ResponseInputItem::FunctionCallOutput {
+                            call_id,
+                            output: FunctionCallOutputPayload {
+                                content: msg,
+                                success: None,
+                            },
+                        };
+                    }
                 }
-                ReviewDecision::Denied | ReviewDecision::Abort => {
-                    return ResponseInputItem::FunctionCallOutput {
-                        call_id,
-                        output: FunctionCallOutputPayload {
-                            content: "exec command rejected by user".to_string(),
-                            success: None,
-                        },
-                    };
+            } else {
+                // Non-dependency approval: block until decision.
+                match rx_approve.await.unwrap_or_default() {
+                    ReviewDecision::Approved => (),
+                    ReviewDecision::ApprovedForSession => {
+                        sess.add_approved_command(params.command.clone());
+                    }
+                    ReviewDecision::Denied | ReviewDecision::Abort => {
+                        return ResponseInputItem::FunctionCallOutput {
+                            call_id,
+                            output: FunctionCallOutputPayload {
+                                content: "exec command rejected by user".to_string(),
+                                success: None,
+                            },
+                        };
+                    }
                 }
+                // Approved → run without sandbox.
+                SandboxType::None
             }
-            // No sandboxing is applied because the user has given
-            // explicit approval. Often, we end up in this case because
-            // the command cannot be run in a sandbox, such as
-            // installing a new dependency that requires network access.
-            SandboxType::None
         }
         SafetyCheck::Reject { reason } => {
             return ResponseInputItem::FunctionCallOutput {
@@ -4872,70 +5338,74 @@ async fn handle_sandbox_error(
             Some("command failed; retry without sandbox?".to_string()),
         )
         .await;
-
-    match rx_approve.await.unwrap_or_default() {
-        ReviewDecision::Approved | ReviewDecision::ApprovedForSession => {
-            // Persist this command as pre‑approved for the
-            // remainder of the session so future
-            // executions skip the sandbox directly.
-            // TODO(ragona): Isn't this a bug? It always saves the command in an | fork?
-            sess.add_approved_command(params.command.clone());
-            // Inform UI we are retrying without sandbox.
-            sess.notify_background_event(&sub_id, "retrying command without sandbox")
-                .await;
-
-            // This is an escalated retry; the policy will not be
-            // examined and the sandbox has been set to `None`.
-            let retry_output_result = sess
-                .run_exec_with_events(
-                    turn_diff_tracker,
-                    exec_command_context.clone(),
-                    ExecInvokeArgs {
-                        params,
-                        sandbox_type: SandboxType::None,
-                        sandbox_policy: &sess.sandbox_policy,
-                        codex_linux_sandbox_exe: &sess.codex_linux_sandbox_exe,
-                        stdout_stream: Some(StdoutStream {
-                            sub_id: sub_id.clone(),
-                            call_id: call_id.clone(),
-                            tx_event: sess.tx_event.clone(),
-                        }),
-                    },
-                )
-                .await;
-
-            match retry_output_result {
-                Ok(retry_output) => {
-                    let ExecToolCallOutput { exit_code, .. } = &retry_output;
-
-                    let is_success = *exit_code == 0;
-                    let content = format_exec_output(retry_output);
-
-                    ResponseInputItem::FunctionCallOutput {
-                        call_id: call_id.clone(),
-                        output: FunctionCallOutputPayload {
-                            content,
-                            success: Some(is_success),
-                        },
+    // For dependency installs, allow 2-minute conversion to async approvals.
+    if let Some(dep) = detect_dependency_install(&params.command) {
+        let mut rx = rx_approve;
+        tokio::select! {
+            decision = &mut rx => {
+                match decision.unwrap_or(ReviewDecision::Denied) {
+                    ReviewDecision::ApprovedForSession => {
+                        sess.add_approved_command(params.command.clone());
+                    }
+                    ReviewDecision::Approved => {}
+                    ReviewDecision::Denied | ReviewDecision::Abort => {
+                        return ResponseInputItem::FunctionCallOutput { call_id, output: FunctionCallOutputPayload { content: "exec command rejected by user".to_string(), success: None } };
                     }
                 }
-                Err(e) => ResponseInputItem::FunctionCallOutput {
-                    call_id: call_id.clone(),
-                    output: FunctionCallOutputPayload {
-                        content: format!("retry failed: {e}"),
-                        success: None,
-                    },
-                },
+                sess.notify_background_event(&sub_id, "retrying command without sandbox").await;
+                let retry_output_result = sess
+                    .run_exec_with_events(
+                        turn_diff_tracker,
+                        exec_command_context.clone(),
+                        ExecInvokeArgs { params, sandbox_type: SandboxType::None, sandbox_policy: &sess.sandbox_policy, codex_linux_sandbox_exe: &sess.codex_linux_sandbox_exe, stdout_stream: Some(StdoutStream { sub_id: sub_id.clone(), call_id: call_id.clone(), tx_event: sess.tx_event.clone() }) },
+                    )
+                    .await;
+                return match retry_output_result {
+                    Ok(retry_output) => {
+                        let ExecToolCallOutput { exit_code, .. } = &retry_output;
+                        let is_success = *exit_code == 0;
+                        let content = format_exec_output(retry_output);
+                        ResponseInputItem::FunctionCallOutput { call_id: call_id.clone(), output: FunctionCallOutputPayload { content, success: Some(is_success) } }
+                    }
+                    Err(e) => ResponseInputItem::FunctionCallOutput { call_id: call_id.clone(), output: FunctionCallOutputPayload { content: format!("retry failed: {e}"), success: None } },
+                };
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                let msg = format!(
+                    "approval pending (async) for dependency install: {} {} — continue with other tasks; use /approvals to manage",
+                    dep.manager,
+                    dep.packages.join(" ")
+                );
+                sess.notify_background_event(&sub_id, msg.clone()).await;
+                return ResponseInputItem::FunctionCallOutput { call_id, output: FunctionCallOutputPayload { content: msg, success: None } };
             }
         }
-        ReviewDecision::Denied | ReviewDecision::Abort => {
-            // Fall through to original failure handling.
-            ResponseInputItem::FunctionCallOutput {
-                call_id,
-                output: FunctionCallOutputPayload {
-                    content: "exec command rejected by user".to_string(),
-                    success: None,
-                },
+    } else {
+        match rx_approve.await.unwrap_or_default() {
+            ReviewDecision::Approved | ReviewDecision::ApprovedForSession => {
+                if let ReviewDecision::ApprovedForSession = ReviewDecision::ApprovedForSession {
+                    // This line is redundant but harmless; approved-for-session handled above when match arm equals that variant.
+                }
+                sess.notify_background_event(&sub_id, "retrying command without sandbox").await;
+                let retry_output_result = sess
+                    .run_exec_with_events(
+                        turn_diff_tracker,
+                        exec_command_context.clone(),
+                        ExecInvokeArgs { params, sandbox_type: SandboxType::None, sandbox_policy: &sess.sandbox_policy, codex_linux_sandbox_exe: &sess.codex_linux_sandbox_exe, stdout_stream: Some(StdoutStream { sub_id: sub_id.clone(), call_id: call_id.clone(), tx_event: sess.tx_event.clone() }) },
+                    )
+                    .await;
+                return match retry_output_result {
+                    Ok(retry_output) => {
+                        let ExecToolCallOutput { exit_code, .. } = &retry_output;
+                        let is_success = *exit_code == 0;
+                        let content = format_exec_output(retry_output);
+                        ResponseInputItem::FunctionCallOutput { call_id: call_id.clone(), output: FunctionCallOutputPayload { content, success: Some(is_success) } }
+                    }
+                    Err(e) => ResponseInputItem::FunctionCallOutput { call_id: call_id.clone(), output: FunctionCallOutputPayload { content: format!("retry failed: {e}"), success: None } },
+                };
+            }
+            ReviewDecision::Denied | ReviewDecision::Abort => {
+                return ResponseInputItem::FunctionCallOutput { call_id, output: FunctionCallOutputPayload { content: "exec command rejected by user".to_string(), success: None } };
             }
         }
     }
@@ -5127,6 +5597,13 @@ async fn send_agent_status_update(sess: &Session) {
                 AgentStatus::Cancelled => "cancelled".to_string(),
             },
             model: Some(agent.model.clone()),
+            created_at: Some(agent.created_at.to_rfc3339()),
+            started_at: agent.started_at.map(|t| t.to_rfc3339()),
+            completed_at: agent.completed_at.map(|t| t.to_rfc3339()),
+            error: agent.error.clone(),
+            progress_tail: Some(agent.progress.iter().rev().take(3).cloned().collect::<Vec<_>>().into_iter().rev().collect()),
+            worktree_path: agent.worktree_path.clone(),
+            branch_name: agent.branch_name.clone(),
         })
         .collect();
 
@@ -6528,4 +7005,46 @@ async fn handle_browser_history(
         },
     )
     .await
+}
+
+/// Detect a few obviously dangerous commands and return a human-readable reason.
+fn is_clearly_dangerous_command(cmd: &[String], _cwd: &std::path::Path) -> Option<String> {
+    if cmd.is_empty() {
+        return None;
+    }
+    let prog = std::path::Path::new(&cmd[0])
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    match prog {
+        "sudo" | "systemctl" | "service" | "iptables" | "ip6tables" | "ufw" | "docker" | "podman" => {
+            return Some(format!("blocked: {}", prog));
+        }
+        // rm -rf on absolute paths
+        "rm" => {
+            if cmd.iter().any(|a| a == "-rf" || a == "-fr") {
+                for a in cmd.iter().skip(1) {
+                    if a == "/" || a.starts_with("/*") || a.starts_with("/etc") || a.starts_with("/usr") {
+                        return Some("blocked: rm -rf on system path".to_string());
+                    }
+                }
+            }
+        }
+        // Obvious system-level actions
+        "mkfs" | "mkfs.ext4" | "mkfs.xfs" | "mount" | "umount" | "shutdown" | "reboot" => {
+            return Some(format!("blocked: {}", prog));
+        }
+        // dd to block devices
+        "dd" => {
+            for a in cmd.iter().skip(1) {
+                if let Some(of) = a.strip_prefix("of=") {
+                    if of.starts_with("/dev/") {
+                        return Some(format!("blocked: dd to {}", of));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    None
 }

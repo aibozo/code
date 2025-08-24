@@ -193,6 +193,20 @@ impl ModelClient {
         let store = prompt.store && auth_mode != Some(AuthMode::ChatGPT);
 
         let full_instructions = prompt.get_full_instructions(&self.config.model_family);
+        // When using ChatGPT OAuth (CODEx endpoint), send a concise instruction
+        // string to satisfy validation and keep the heavy guidance in the
+        // developer message + input items.
+        let short_chatgpt_instructions: Option<String> = if auth_mode == Some(AuthMode::ChatGPT) {
+            Some(
+                "You are Codex CLI, a terminal coding agent. Follow the developer message and input items for rules. Be precise, safe, and use tools when appropriate.".to_string(),
+            )
+        } else {
+            None
+        };
+        let instructions_opt: Option<&str> = match auth_mode {
+            Some(AuthMode::ChatGPT) => short_chatgpt_instructions.as_deref(),
+            _ => Some(full_instructions.as_ref()),
+        };
         let tools_json = create_tools_json_for_responses_api(&prompt.tools)?;
         let reasoning = create_reasoning_param_for_request(
             &self.config.model_family,
@@ -221,7 +235,7 @@ impl ModelClient {
 
         let payload = ResponsesApiRequest {
             model: &self.config.model,
-            instructions: &full_instructions,
+            instructions: instructions_opt,
             input: &input_with_instructions,
             tools: &tools_json,
             tool_choice: "auto",
@@ -248,6 +262,33 @@ impl ModelClient {
         } else {
             String::new()
         };
+
+        // Optional on-disk dump for local troubleshooting (writes to repo logs/)
+        if std::env::var("CODEX_DUMP_REQUEST").ok().as_deref() == Some("1") {
+            let _ = (|| -> std::io::Result<()> {
+                let mut dir = self.config.cwd.join("logs");
+                std::fs::create_dir_all(&dir).ok();
+                let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+                let f = dir.join(format!("request-{}-{}.json", ts, self.session_id));
+                // Avoid dumping extremely large strings; include a short preview and lengths
+                let instr_preview = payload
+                    .instructions
+                    .map(|s| if s.len() > 240 { format!("{}…", &s[..240]) } else { s.to_string() });
+                let dump = serde_json::json!({
+                    "endpoint": endpoint,
+                    "auth_mode": auth_mode.map(|m| format!("{:?}", m).to_lowercase()),
+                    "model": self.config.model,
+                    "instructions_len": payload.instructions.map(|s| s.len()),
+                    "instructions_head": instr_preview,
+                    "input_count": payload.input.len(),
+                    "tool_count": payload.tools.len(),
+                    "store": payload.store,
+                    "stream": payload.stream,
+                    "include": payload.include,
+                });
+                std::fs::write(&f, serde_json::to_string_pretty(&dump).unwrap_or_else(|_| "{}".to_string()))
+            })();
+        }
 
         loop {
             attempt += 1;
@@ -350,6 +391,19 @@ impl ModelClient {
                     {
                         // Surface the error body to callers. Use `unwrap_or_default` per Clippy.
                         let body = res.text().await.unwrap_or_default();
+                        if std::env::var("CODEX_DUMP_REQUEST").ok().as_deref() == Some("1") {
+                            let _ = (|| -> std::io::Result<()> {
+                                let mut dir = self.config.cwd.join("logs");
+                                std::fs::create_dir_all(&dir).ok();
+                                let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+                                let f = dir.join(format!("response-error-{}-{}.json", ts, self.session_id));
+                                let dump = serde_json::json!({
+                                    "status": status.as_u16(),
+                                    "body": body,
+                                });
+                                std::fs::write(&f, serde_json::to_string_pretty(&dump).unwrap_or_else(|_| "{}".to_string()))
+                            })();
+                        }
                         // Log error response
                         if let Ok(logger) = self.debug_logger.lock() {
                             let _ = logger.append_response_event(

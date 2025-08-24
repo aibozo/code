@@ -512,6 +512,37 @@ pub(crate) fn get_openai_tools(
     tools
 }
 
+pub(crate) fn create_arxiv_search_tool() -> OpenAiTool {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "query".to_string(),
+        JsonSchema::String { description: Some("Search query (topic or keywords)".to_string()) },
+    );
+    properties.insert(
+        "max_results".to_string(),
+        JsonSchema::Number { description: Some("Maximum number of results (default 50, max 100)".to_string()) },
+    );
+    properties.insert(
+        "year_start".to_string(),
+        JsonSchema::Number { description: Some("Optional start year filter (inclusive)".to_string()) },
+    );
+    properties.insert(
+        "year_end".to_string(),
+        JsonSchema::Number { description: Some("Optional end year filter (inclusive)".to_string()) },
+    );
+
+    OpenAiTool::Function(ResponsesApiTool {
+        name: "arxiv_search".to_string(),
+        description: "Search arXiv and return normalized JSON array of sources: [{url,title,year,authors,summary,score}] (online with cache fallback).".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["query".to_string()]),
+            additional_properties: Some(false),
+        },
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {

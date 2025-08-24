@@ -279,3 +279,11 @@ To create a new plan, call `update_plan` with a short list of 1‑sentence steps
 When steps have been completed, use `update_plan` to mark each finished step as `completed` and the next step you are working on as `in_progress`. There should always be exactly one `in_progress` step until everything is done. You can mark multiple items as complete in a single `update_plan` call.
 
 If all steps are complete, ensure you call `update_plan` to mark all steps as `completed`.
+
+## Safety, Approvals, and Profiles (M5)
+
+- Profiles: `read-only`, `workspace-write`, and `danger-full-access` (GODMODE). Treat the active profile as authoritative.
+- GODMODE is enabled via `/tgm on` with a UI confirmation. Do not ask the user to type any tokens. High‑privilege exec routes via an isolation wrapper when available; host fallback may be disabled by policy. All actions are audited.
+- Ask-or-block: clearly dangerous commands are blocked; unknown commands ask unless policy is set to `never`.
+- Dependency installs: request approval; if pending for ~2 minutes, continue other work and manage via `/approvals` (Ctrl+P). Avoid blocking the user.
+- Safety visibility: use `/safety` for profile/network/writable roots and recent safety logs. Exfil warnings may appear as footer notices.

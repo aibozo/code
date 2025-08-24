@@ -374,6 +374,61 @@ async fn chatgpt_auth_sends_correct_request() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chatgpt_auth_sends_minimal_instructions() {
+    if std::env::var(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
+        println!(
+            "Skipping test because it cannot execute when network is disabled in a Codex sandbox."
+        );
+        return;
+    }
+
+    // Mock server
+    let server = MockServer::start().await;
+
+    let first = ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_raw(sse_completed("resp1"), "text/event-stream");
+
+    Mock::given(method("POST"))
+        .and(path("/api/codex/responses"))
+        .respond_with(first)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let model_provider = ModelProviderInfo {
+        base_url: Some(format!("{}/api/codex", server.uri())),
+        ..built_in_model_providers()["openai"].clone()
+    };
+
+    // Init session with ChatGPT OAuth auth
+    let codex_home = TempDir::new().unwrap();
+    let mut config = load_default_config_for_test(&codex_home);
+    config.model_provider = model_provider;
+    let conversation_manager = ConversationManager::default();
+    let codex = conversation_manager
+        .new_conversation_with_auth(config, Some(create_dummy_codex_auth()))
+        .await
+        .expect("create new conversation")
+        .conversation;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![InputItem::Text { text: "hello".into() }],
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+
+    // The payload should include a minimal top‑level `instructions` under ChatGPT auth
+    let request = &server.received_requests().await.unwrap()[0];
+    let request_body = request.body_json::<serde_json::Value>().unwrap();
+    let instr = request_body.get("instructions").and_then(|v| v.as_str()).expect("instructions should be present for ChatGPT auth");
+    assert!(instr.len() > 10 && instr.len() < 300, "instructions should be concise; got len={}", instr.len());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prefers_chatgpt_token_when_config_prefers_chatgpt() {
     if std::env::var(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
         println!(

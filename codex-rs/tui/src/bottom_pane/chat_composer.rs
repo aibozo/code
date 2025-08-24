@@ -114,6 +114,8 @@ pub(crate) struct ChatComposer {
     // chat ScrollDown instead of moving within the textarea, unless another
     // key is pressed in between.
     next_down_scrolls_history: bool,
+    // Optional concurrency/agents footer text (e.g., "agents: running 2")
+    agent_footer: Option<String>,
 }
 
 /// Popup state – at most one can be visible at any time.
@@ -159,6 +161,7 @@ impl ChatComposer {
             show_compression_hint: true,
             compression_enabled: false,
             next_down_scrolls_history: false,
+            agent_footer: None,
         }
     }
 
@@ -200,6 +203,10 @@ impl ChatComposer {
     pub fn flash_footer_notice(&mut self, text: String) {
         let expiry = std::time::Instant::now() + std::time::Duration::from_secs(2);
         self.footer_notice = Some((text, expiry));
+    }
+
+    pub fn set_agent_footer(&mut self, text: Option<String>) {
+        self.agent_footer = text;
     }
 
     // Control footer hint visibility
@@ -1281,7 +1288,7 @@ impl WidgetRef for &ChatComposer {
                     }
                 }
 
-                // Right side: command key hints (Ctrl+R/D/C) followed by token usage if available
+                // Right side: command key hints (Ctrl+R/D/C) followed by agents/concurrency and then token usage if available
                 // We will elide hints when space is tight in this order: hide reasoning, diff viewer.
                 let mut right_spans: Vec<Span> = Vec::new();
 
@@ -1306,10 +1313,42 @@ impl WidgetRef for &ChatComposer {
                     }
                 }
 
-                // Helper to build hint spans based on inclusion flags
+                // Prepare agent/concurrency spans
+                let mut agent_spans: Vec<Span> = Vec::new();
+                if let Some(text) = &self.agent_footer {
+                    // Highlight approvals count when > 0
+                    if let Some(pos) = text.find("approvals ") {
+                        let (pre, rest) = text.split_at(pos);
+                        let count_str: String = rest.chars().skip("approvals ".len()).take_while(|c| c.is_ascii_digit()).collect();
+                        if let Ok(n) = count_str.parse::<u32>() {
+                            if n > 0 {
+                                if !pre.is_empty() { agent_spans.push(Span::from(pre.to_string()).style(label_style)); agent_spans.push(Span::from(" ").style(label_style)); }
+                                agent_spans.push(Span::from("approvals ").style(label_style));
+                                // Brighter color to draw attention
+                                agent_spans.push(Span::from(count_str).style(Style::default().fg(crate::colors::function()).add_modifier(Modifier::BOLD)));
+                            } else {
+                                agent_spans.push(Span::from(text.clone()).style(label_style));
+                            }
+                        } else {
+                            agent_spans.push(Span::from(text.clone()).style(label_style));
+                        }
+                    } else {
+                        agent_spans.push(Span::from(text.clone()).style(label_style));
+                    }
+                }
+
+                // Helper to build hint spans based on inclusion flags.
+                // Priority policy when overcrowded:
+                //   1) Keep compression and Ctrl+P (Approvals) visible.
+                //   2) Elide reasoning (Ctrl+R), then diff (Ctrl+D), then leave quit at end if space permits.
                 let build_hints = |include_reasoning: bool, include_diff: bool| -> Vec<Span> {
                     let mut spans: Vec<Span> = Vec::new();
                     if !self.ctrl_c_quit_hint {
+                        // High‑priority: Approvals quick access (Ctrl+P)
+                        if !spans.is_empty() { spans.push(Span::from("  •  ").style(Style::default())); }
+                        spans.push(Span::from("Ctrl+P").style(key_hint_style));
+                        spans.push(Span::from(" approvals").style(label_style));
+
                         if self.show_reasoning_hint && include_reasoning {
                             if !spans.is_empty() { spans.push(Span::from("  •  ").style(Style::default())); }
                             spans.push(Span::from("Ctrl+R").style(key_hint_style));
@@ -1321,7 +1360,7 @@ impl WidgetRef for &ChatComposer {
                             spans.push(Span::from("Ctrl+D").style(key_hint_style));
                             spans.push(Span::from(" diff viewer").style(label_style));
                         }
-                        // Always show compression hint when enabled (subject to overall right-side elision only after reasoning/diff)
+                        // High‑priority: Compression hint/state (Ctrl+X)
                         if self.show_compression_hint {
                             if !spans.is_empty() { spans.push(Span::from("  •  ").style(Style::default())); }
                             spans.push(Span::from("Ctrl+X").style(key_hint_style));
@@ -1352,14 +1391,15 @@ impl WidgetRef for &ChatComposer {
                 let trailing_pad = 1usize; // one space on the right edge
 
                 // We'll add separators between hints and tokens when both are present
-                let combined_len = |h: &Vec<Span>, t: &Vec<Span>| -> usize {
-                    let mut len = measure(h) + measure(t);
-                    if !h.is_empty() && !t.is_empty() { len += "  •  ".chars().count(); }
+                let combined_len = |h: &Vec<Span>, a: &Vec<Span>, t: &Vec<Span>| -> usize {
+                    let mut len = measure(h) + measure(a) + measure(t);
+                    if !h.is_empty() && (!a.is_empty() || !t.is_empty()) { len += "  •  ".chars().count(); }
+                    if !a.is_empty() && !t.is_empty() { len += "  •  ".chars().count(); }
                     len
                 };
 
-                // Elide hints in order until content fits
-                while left_len + combined_len(&hint_spans, &token_spans) + trailing_pad > total_width {
+                // Elide hints in order until content fits (drop lower-priority first)
+                while left_len + combined_len(&hint_spans, &agent_spans, &token_spans) + trailing_pad > total_width {
                     if include_reasoning {
                         include_reasoning = false;
                     } else if include_diff {
@@ -1372,6 +1412,10 @@ impl WidgetRef for &ChatComposer {
 
                 // Compose final right spans: hints, optional separator, then tokens
                 if !hint_spans.is_empty() { right_spans.extend(hint_spans); }
+                if !right_spans.is_empty() && (!agent_spans.is_empty() || !token_spans.is_empty()) {
+                    right_spans.push(Span::from("  •  ").style(Style::default()));
+                }
+                right_spans.extend(agent_spans);
                 if !right_spans.is_empty() && !token_spans.is_empty() {
                     right_spans.push(Span::from("  •  ").style(Style::default()));
                 }

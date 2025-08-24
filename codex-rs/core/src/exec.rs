@@ -26,8 +26,15 @@ use crate::protocol::SandboxPolicy;
 use crate::seatbelt::spawn_command_under_seatbelt;
 use crate::spawn::StdioPolicy;
 use crate::spawn::spawn_child_async;
-use crate::policy_yaml::{PolicyYaml, append_policy_log};
+use crate::policy_yaml::{PolicyYaml, append_policy_log, allowed_hosts_for_level};
+use crate::enforcement_advisor::advise_for_command;
+#[cfg(feature = "enforcement-stub")]
+use crate::enforcement_gate::{decide as enforcement_decide, GateDecision};
 use serde_bytes::ByteBuf;
+use once_cell::sync::OnceCell;
+
+// Track per-session GODMODE wall-time budget start
+static GODMODE_START: OnceCell<std::time::Instant> = OnceCell::new();
 
 // Maximum we send for each stream, which is either:
 // - 10KiB OR
@@ -67,6 +74,10 @@ pub enum SandboxType {
 
     /// Only available on Linux.
     LinuxSeccomp,
+    /// High-privilege mode executed via an external microVM/container wrapper.
+    /// Currently selected only when the session sandbox policy is
+    /// `DangerFullAccess` and a wrapper is available on the host.
+    MicroVm,
 }
 
 #[derive(Clone)]
@@ -127,6 +138,32 @@ pub async fn process_exec_tool_call(
         }
     }
 
+    // M2 (stub): Provide a non-blocking enforcement advisory based on the current sandbox policy.
+    if let Some(s) = advise_for_command(sandbox_policy, &params.command) {
+        if let Some(sout) = &stdout_stream {
+            // Emit advisory as a background event so tests comparing stream payloads are stable.
+            let _ = sout.tx_event.try_send(Event {
+                id: sout.sub_id.clone(),
+                msg: EventMsg::BackgroundEvent(crate::protocol::BackgroundEventEvent { message: s }),
+            });
+        }
+    }
+
+    // Optional enforcement gate (feature-gated). Deny early with clear message.
+    #[cfg(feature = "enforcement-stub")]
+    {
+        match enforcement_decide(sandbox_policy, &params.command, &params.cwd) {
+            GateDecision::Deny { message } => {
+                return Err(CodexErr::Sandbox(SandboxErr::Denied(
+                    1,
+                    String::new(),
+                    message,
+                )));
+            }
+            GateDecision::Allow => {}
+        }
+    }
+
     let raw_output_result: std::result::Result<RawExecToolCallOutput, CodexErr> = match sandbox_type
     {
         SandboxType::None => exec(params, sandbox_policy, stdout_stream.clone()).await,
@@ -165,6 +202,176 @@ pub async fn process_exec_tool_call(
             .await?;
 
             consume_truncated_output(child, timeout, stdout_stream).await
+        }
+        SandboxType::MicroVm => {
+            // GODMODE flow: prefer a microVM/container wrapper if available. This
+            // keeps host free of direct exec, while still providing a high‑privilege
+            // environment. We make a best‑effort attempt and fall back to host
+            // execution with a loud warning if no wrapper is present.
+            let timeout = params.timeout_duration();
+            let ExecParams { command, cwd, env, .. } = params;
+
+            // Enforce optional per-session wall-time budget for GODMODE
+            if let Some(py) = PolicyYaml::load_from_repo(&cwd) {
+                if let Some(secs) = py.godmode_wall_time_secs() {
+                    let start = GODMODE_START.get_or_init(std::time::Instant::now);
+                    if start.elapsed() > std::time::Duration::from_secs(secs.max(1)) {
+                        let msg = format!(
+                            "[godmode] time budget exceeded ({}s); refusing to run more high‑privilege commands",
+                            secs
+                        );
+                        return Err(CodexErr::Sandbox(SandboxErr::Denied(1, String::new(), msg)));
+                    }
+                }
+            }
+
+            // Determine wrapper script. Prefer Firecracker stub, fall back to gVisor stub.
+            let firecracker = cwd.join("sandbox").join("firecracker").join("start.sh");
+            let gvisor = cwd.join("sandbox").join("gvisor").join("run.sh");
+
+            // Helper to check executability (exists + is_file)
+            let pick_wrapper = if firecracker.is_file() { Some(firecracker) }
+                else if gvisor.is_file() { Some(gvisor) } else { None };
+
+            if let Some(wrapper) = pick_wrapper {
+                // Audit: record godmode execution via wrapper
+                if let Some(py) = PolicyYaml::load_from_repo(&cwd) {
+                    let log_path = py.policy_log_path(&cwd);
+                    let event = serde_json::json!({
+                        "ts": chrono::Utc::now().to_rfc3339(),
+                        "event": "godmode_microvm_exec",
+                        "wrapper": wrapper.to_string_lossy(),
+                        "command": command,
+                        "cwd": cwd,
+                    });
+                    append_policy_log(&log_path, event);
+                }
+                // Policy args to wrapper: read-only host FS, explicit writable
+                // project root, and network disabled by default.
+                let mut args: Vec<String> = Vec::new();
+                args.push("--cwd".to_string());
+                args.push(cwd.to_string_lossy().to_string());
+                args.push("--writable".to_string());
+                args.push(cwd.to_string_lossy().to_string());
+                // Default: network off unless policy explicitly allows network
+                let net_off = match sandbox_policy {
+                    SandboxPolicy::DangerFullAccess => true,
+                    SandboxPolicy::ReadOnly => false,
+                    SandboxPolicy::WorkspaceWrite { network_access, .. } => !*network_access,
+                };
+                args.push("--network".to_string());
+                args.push(if net_off { "off".to_string() } else { "on".to_string() });
+                args.push("--".to_string());
+                args.extend(command.clone());
+
+                // Invoke wrapper with policy args and the original command after '--'.
+                // We inherit no stdin and capture stdout/stderr like other tool calls.
+                let child = spawn_child_async(
+                    wrapper,
+                    args,
+                    None,
+                    cwd,
+                    sandbox_policy,
+                    StdioPolicy::RedirectForShellTool,
+                    env,
+                )
+                .await?;
+                consume_truncated_output(child, timeout, stdout_stream).await
+            } else {
+                // Respect policy flag to optionally allow or reject host fallback
+                if let Some(py) = PolicyYaml::load_from_repo(&cwd) {
+                    if !py.godmode_allow_host_fallback() {
+                        let msg = "[godmode] isolation wrapper not found and host fallback is disabled by policy (configs/policy.yaml godmode.allow_host_fallback)";
+                        // Audit
+                        let log_path = py.policy_log_path(&cwd);
+                        append_policy_log(&log_path, serde_json::json!({
+                            "ts": chrono::Utc::now().to_rfc3339(),
+                            "event": "godmode_fallback_blocked",
+                            "command": command,
+                            "cwd": cwd,
+                        }));
+                        return Err(CodexErr::Sandbox(SandboxErr::Denied(1, String::new(), msg.to_string())));
+                    }
+                }
+                // No wrapper found – run on host but surface a clear warning and
+                // log an audit event so users can verify the fallback occurred.
+                if let Some(s) = &stdout_stream {
+                    let warn = "[godmode] isolation wrapper not found; running on host";
+                    let _ = s.tx_event.try_send(Event {
+                        id: s.sub_id.clone(),
+                        msg: EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+                            call_id: s.call_id.clone(),
+                            stream: ExecOutputStream::Stderr,
+                            chunk: ByteBuf::from(format!("{}\n", warn).into_bytes()),
+                        }),
+                    });
+                }
+
+                // Also append to policy log if present
+                if let Some(py) = PolicyYaml::load_from_repo(&cwd) {
+                    let log_path = py.policy_log_path(&cwd);
+                    let event = serde_json::json!({
+                        "ts": chrono::Utc::now().to_rfc3339(),
+                        "event": "godmode_fallback_host_exec",
+                        "command": command,
+                        "cwd": cwd,
+                    });
+                    append_policy_log(&log_path, event);
+                }
+
+                // Best-effort exfiltration monitor: warn on outbound hosts not allowed by policy
+                if let Some(py) = PolicyYaml::load_from_repo(&cwd) {
+                    if let Some(level) = py.active_level() {
+                        let allowed_hosts = allowed_hosts_for_level(&py, level);
+                        if let Some(hosts) = detect_outbound_hosts(&command) {
+                            for h in hosts {
+                                if !allowed_hosts.contains(&h) {
+                                    if let Some(s) = &stdout_stream {
+                                        let hint = format!(
+                                            "[safety] exfil warning: outbound host '{}' not in allowed_hosts — see /safety",
+                                            h
+                                        );
+                                        let _ = s.tx_event.try_send(Event {
+                                            id: s.sub_id.clone(),
+                                            msg: EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+                                                call_id: s.call_id.clone(),
+                                                stream: ExecOutputStream::Stderr,
+                                                chunk: ByteBuf::from(format!("{}\n", hint).into_bytes()),
+                                            }),
+                                        });
+                                    }
+                                    let event = serde_json::json!({
+                                        "ts": chrono::Utc::now().to_rfc3339(),
+                                        "event": "exfil_warning",
+                                        "host": h,
+                                        "command": command,
+                                        "cwd": cwd,
+                                    });
+                                    if let Some(py) = PolicyYaml::load_from_repo(&cwd) {
+                                        let log_path = py.policy_log_path(&cwd);
+                                        append_policy_log(&log_path, event);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let (program, args) = command.split_first().ok_or_else(|| {
+                    CodexErr::Io(io::Error::new(io::ErrorKind::InvalidInput, "command args are empty"))
+                })?;
+                let child = spawn_child_async(
+                    PathBuf::from(program),
+                    args.into(),
+                    None,
+                    cwd,
+                    sandbox_policy,
+                    StdioPolicy::RedirectForShellTool,
+                    env,
+                )
+                .await?;
+                consume_truncated_output(child, timeout, stdout_stream).await
+            }
         }
     };
     let duration = start.elapsed();
@@ -224,6 +431,44 @@ fn is_likely_sandbox_denied(sandbox_type: SandboxType, exit_code: i32) -> bool {
 
     // For all other cases, we assume the sandbox is the cause
     true
+}
+
+/// Very small parser to extract obvious outbound hosts from common tools.
+fn detect_outbound_hosts(cmd: &[String]) -> Option<Vec<String>> {
+    if cmd.is_empty() { return None; }
+    let prog = std::path::Path::new(&cmd[0])
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&cmd[0]);
+    let mut out: Vec<String> = Vec::new();
+    let extract_from_url = |s: &str| -> Option<String> {
+        if let Some(rest) = s.strip_prefix("http://").or_else(|| s.strip_prefix("https://")) {
+            let host = rest.split('/').next().unwrap_or("");
+            if !host.is_empty() { return Some(host.to_string()); }
+        }
+        None
+    };
+    match prog {
+        "curl" | "wget" => {
+            for a in cmd.iter().skip(1) {
+                if let Some(h) = extract_from_url(a) { out.push(h); }
+            }
+        }
+        "git" => {
+            // git clone <url> or git fetch <remote>
+            if cmd.len() >= 3 && (cmd[1] == "clone" || cmd[1] == "fetch") {
+                let url = cmd[2].as_str();
+                if let Some(h) = extract_from_url(url) { out.push(h); }
+                else if let Some((_, rest)) = url.split_once('@') {
+                    // git@github.com:org/repo.git
+                    let h = rest.split(':').next().unwrap_or("");
+                    if !h.is_empty() { out.push(h.to_string()); }
+                }
+            }
+        }
+        _ => {}
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 #[derive(Debug)]

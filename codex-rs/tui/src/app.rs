@@ -229,6 +229,26 @@ impl App<'_> {
                 header.push(Span::styled(sandbox_str.clone(), Style::default()));
                 lines.push(Line::from(header));
                 lines.push(Line::from(""));
+
+                // M5: Prominent GODMODE banner and consent reminder
+                if matches!(config.sandbox_policy, codex_core::protocol::SandboxPolicy::DangerFullAccess) {
+                    use ratatui::style::{Stylize, Color};
+                    use ratatui::text::Span;
+                    let mut banner: Vec<Line<'static>> = Vec::new();
+                    banner.push(Line::from(Span::styled(
+                        "GODMODE: High‑privilege session (isolated via wrapper when available)",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    )));
+                    banner.push(Line::from("- Commands may affect your system. Ensure you trust this repo."));
+                    banner.push(Line::from(
+                        "- Actions are being audited to logs/policy.jsonl (see configs/policy.yaml).",
+                    ));
+                    banner.push(Line::from(
+                        "- To disable GODMODE, restart without --dangerously-bypass-approvals-and-sandbox.",
+                    ));
+                    banner.push(Line::from(""));
+                    chat_widget.push_notice_lines(banner);
+                }
                 chat_widget.push_notice_lines(lines);
 
                 // Attempt to read policy.yaml and log startup
@@ -285,12 +305,15 @@ impl App<'_> {
                             // Summaries per stage
                             let mut ok_cnt = 0usize;
                             let mut err_cnt = 0usize;
+                            let mut cached_cnt = 0usize;
                             if let Some(stages) = last_json.get("stages").and_then(|v| v.as_array()) {
                                 for st in stages {
                                     let name = st.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                                     let status = st.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                                    if st.get("cached").and_then(|v| v.as_bool()).unwrap_or(false) { cached_cnt += 1; }
                                     match status { "ok" => ok_cnt += 1, "error" => err_cnt += 1, _ => {} }
-                                    lines.push(Line::from(format!("  - {}: {}", name, status)));
+                                    let cached = if st.get("cached").and_then(|v| v.as_bool()).unwrap_or(false) { " (cached)" } else { "" };
+                                    lines.push(Line::from(format!("  - {}: {}{}", name, status, cached)));
                                 }
                             }
                             // Delta vs previous
@@ -310,6 +333,7 @@ impl App<'_> {
                                 let d_err = err_cnt as isize - prev_err as isize;
                                 lines.push(Line::from(format!("  Δ stages ok: {d_ok:+}, error: {d_err:+}")));
                             }
+                            lines.push(Line::from(format!("  cached stages: {}", cached_cnt)));
                             lines.push(Line::from(""));
                             chat_widget.push_notice_lines(lines);
                         }
@@ -405,6 +429,17 @@ impl App<'_> {
         let app_event_tx = self.app_event_tx.clone();
         app_event_tx.send(AppEvent::RequestRedraw);
 
+        // Start periodic approvals refresh (every 5 seconds)
+        {
+            let tx = self.app_event_tx.clone();
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    tx.send(AppEvent::ApprovalsRefresh);
+                }
+            });
+        }
+
         // If a startup command is configured, dispatch it immediately after first redraw request.
         if let Some(cmd) = self.startup_command.take() {
             match crate::slash_command::process_slash_command_message(&cmd) {
@@ -459,6 +494,11 @@ impl App<'_> {
                     // Advance streaming animation: commit at most one queued line
                     if let AppState::Chat { widget } = &mut self.app_state {
                         widget.on_commit_tick();
+                    }
+                }
+                AppEvent::ApprovalsRefresh => {
+                    if let AppState::Chat { widget } = &mut self.app_state {
+                        widget.refresh_approvals_footer();
                     }
                 }
                 AppEvent::KeyEvent(key_event) => {
@@ -575,6 +615,17 @@ impl App<'_> {
                         } => {
                             self.dispatch_key_event(key_event);
                         }
+                        KeyEvent {
+                            code: KeyCode::Char('p'),
+                            modifiers: crossterm::event::KeyModifiers::CONTROL,
+                            kind: KeyEventKind::Press,
+                            ..
+                        } => {
+                            // Open Approvals view (dependency approvals manager)
+                            if let AppState::Chat { widget } = &mut self.app_state {
+                                widget.show_approvals_view();
+                            }
+                        }
                         _ => {
                             // Ignore Release key events.
                         }
@@ -610,16 +661,48 @@ impl App<'_> {
                     };
 
                     match command {
+                        SlashCommand::Tgm => {
+                            if let AppState::Chat { widget } = &mut self.app_state {
+                                widget.handle_tgm_command(command_args);
+                            }
+                        }
+                        SlashCommand::Checkpoint => {
+                            if let AppState::Chat { widget } = &mut self.app_state {
+                                widget.handle_checkpoint_command(command_args);
+                            }
+                        }
+                        SlashCommand::Relaunch => {
+                            if let AppState::Chat { widget } = &mut self.app_state {
+                                widget.handle_relaunch_command(command_args);
+                            }
+                        }
                         SlashCommand::Reports => {
                             if let AppState::Chat { widget } = &mut self.app_state {
                                 let args = command_args.split_whitespace().collect::<Vec<_>>();
                                 match args.as_slice() {
                                     [] => widget.show_reports_picker(),
+                                    ["trends"] => widget.show_trends(7),
+                                    ["trends", n] => {
+                                        let d = n.parse::<usize>().unwrap_or(7);
+                                        widget.show_trends(d);
+                                    }
+                                    ["context"] => widget.show_reports_context_picker(),
+                                    ["context", label] => widget.show_reports_by_context(label),
                                     [day] => widget.show_reports_run_picker(day),
                                     [day, second] if *second == "summary" => widget.show_daily_summary_for(day),
                                     [day, ts] => widget.show_report_view_for_day_and_ts(day, ts),
                                     _ => widget.show_reports_picker(),
                                 }
+                            }
+                        }
+                        SlashCommand::Safety => {
+                            if let AppState::Chat { widget } = &mut self.app_state {
+                                widget.show_safety_view();
+                            }
+                        }
+                        SlashCommand::Approvals => {
+                            if let AppState::Chat { widget } = &mut self.app_state {
+                                widget.show_approvals_view();
                             }
                         }
                         SlashCommand::New => {
@@ -713,6 +796,16 @@ impl App<'_> {
                                 widget.show_theme_selection();
                             }
                         }
+                        SlashCommand::Accept => {
+                            if let AppState::Chat { widget } = &mut self.app_state {
+                                widget.handle_accept_command();
+                            }
+                        }
+                        SlashCommand::Revert => {
+                            if let AppState::Chat { widget } = &mut self.app_state {
+                                widget.handle_revert_command();
+                            }
+                        }
                         SlashCommand::Prompts => {
                             if let AppState::Chat { widget } = &mut self.app_state {
                                 widget.add_prompts_output();
@@ -728,6 +821,16 @@ impl App<'_> {
                                 widget.handle_harness_command(command_args);
                             }
                         }
+                        SlashCommand::Loop => {
+                            if let AppState::Chat { widget } = &mut self.app_state {
+                                widget.handle_loop_command(command_args);
+                            }
+                        }
+                        SlashCommand::Improve => {
+                            if let AppState::Chat { widget } = &mut self.app_state {
+                                widget.handle_improve_command(command_args);
+                            }
+                        }
                         SlashCommand::Memory => {
                             if let AppState::Chat { widget } = &mut self.app_state {
                                 widget.handle_memory_command(command_args);
@@ -735,7 +838,7 @@ impl App<'_> {
                         }
                         // Prompt-expanding commands should have been handled in submit_user_message
                         // but add a fallback just in case
-                        SlashCommand::Plan | SlashCommand::Solve | SlashCommand::Code => {
+                        SlashCommand::Plan | SlashCommand::Act | SlashCommand::Solve | SlashCommand::Reflect | SlashCommand::Code => {
                             // These should have been expanded already, but handle them anyway
                             if let AppState::Chat { widget } = &mut self.app_state {
                                 let expanded = command.expand_prompt(&command_text);

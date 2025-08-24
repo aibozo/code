@@ -83,6 +83,9 @@ enum Subcommand {
 
     /// Run the evaluation harness.
     Harness(HarnessCommand),
+
+    /// Run an orchestrated improvement cycle (M4 supervisor).
+    Improve(ImproveCommand),
 }
 
 #[derive(Debug, Parser)]
@@ -105,6 +108,9 @@ enum DebugCommand {
 
     /// Run a command under Landlock+seccomp (Linux only).
     Landlock(LandlockCommand),
+
+    /// Inspect the computed request endpoint and instructions policy without sending a request.
+    InspectRequest(InspectRequestArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -158,6 +164,9 @@ enum MemorySubcommand {
 
     /// Rebuild the code index for the current project (code-kind vectors only).
     Reindex(MemoryReindexCommand),
+
+    /// Reingest graph memory from existing runs and episodes in the repo.
+    Reingest(MemoryReingestCommand),
 }
 
 #[derive(Debug, Parser)]
@@ -171,12 +180,22 @@ struct MemoryLoginCommand {
 struct MemoryReindexCommand {}
 
 #[derive(Debug, Parser)]
+struct MemoryReingestCommand {}
+
+#[derive(Debug, Parser)]
 struct HarnessCommand {
     #[clap(skip)]
     config_overrides: CliConfigOverrides,
 
     #[command(subcommand)]
     action: HarnessSubcommand,
+}
+
+#[derive(Debug, Parser)]
+struct InspectRequestArgs {
+    /// Auth mode to simulate: auto|chatgpt|api
+    #[arg(long = "auth", value_name = "MODE")]
+    auth_mode: Option<String>,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -190,6 +209,46 @@ struct HarnessRunCommand {
     /// RNG seed for deterministic runs.
     #[arg(long = "seed", value_name = "N")]
     seed: Option<u64>,
+
+    /// Disable stage cache to force fresh execution.
+    #[arg(long = "no-cache")]
+    no_cache: bool,
+
+    /// Optional context label (e.g., branch name) to include in results.
+    #[arg(long = "context", value_name = "NAME")]
+    context: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct ImproveCommand {
+    #[clap(skip)]
+    config_overrides: CliConfigOverrides,
+    /// High-level goal for the improvement cycle.
+    pub goal: String,
+
+    /// Maximum number of attempts to try before stopping.
+    #[arg(long = "max-attempts", value_name = "N", default_value_t = 1)]
+    max_attempts: usize,
+
+    /// Execute without asking for approvals for each write (policy still enforced by profile).
+    #[arg(long = "no-approval", default_value_t = false)]
+    no_approval: bool,
+
+    /// Optional wall-time budget in seconds for the entire improve loop.
+    #[arg(long = "wall-time", value_name = "SECS")]
+    wall_time_secs: Option<u64>,
+
+    /// Optional token budget target for subagents (not enforced in MVP).
+    #[arg(long = "token-budget", value_name = "TOKENS")]
+    token_budget: Option<u64>,
+
+    /// Optional concurrency cap for subagents (not used in MVP).
+    #[arg(long = "concurrency", value_name = "N")]
+    concurrency: Option<u32>,
+
+    /// Optional context label for harness runs (e.g., branch, task).
+    #[arg(long = "context", value_name = "NAME")]
+    context: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -261,6 +320,11 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 )
                 .await?;
             }
+            DebugCommand::InspectRequest(mut args) => {
+                let mut tui_cli = cli.interactive; // reuse overrides container
+                prepend_config_flags(&mut tui_cli.config_overrides, cli.config_overrides);
+                debug_inspect_request(tui_cli.config_overrides, args).await?;
+            }
         },
         Some(Subcommand::Apply(mut apply_cli)) => {
             prepend_config_flags(&mut apply_cli.config_overrides, cli.config_overrides);
@@ -278,6 +342,9 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 MemorySubcommand::Reindex(_cmd) => {
                     memory_reindex(mem_cli.config_overrides).await?;
                 }
+                MemorySubcommand::Reingest(_cmd) => {
+                    memory_reingest(mem_cli.config_overrides).await?;
+                }
             }
         }
         Some(Subcommand::Harness(mut h_cli)) => {
@@ -287,6 +354,11 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                     harness_run(h_cli.config_overrides, cmd).await?;
                 }
             }
+        }
+        Some(Subcommand::Improve(mut imp_cli)) => {
+            prepend_config_flags(&mut imp_cli.config_overrides, cli.config_overrides);
+            let cfg_overrides = std::mem::take(&mut imp_cli.config_overrides);
+            improve_run(cfg_overrides, imp_cli).await?;
         }
     }
 
@@ -354,6 +426,24 @@ async fn memory_reindex(cli_config_overrides: CliConfigOverrides) -> anyhow::Res
             eprintln!("Failed to rebuild code index: {e}");
         }
     }
+    Ok(())
+}
+
+async fn memory_reingest(cli_config_overrides: CliConfigOverrides) -> anyhow::Result<()> {
+    // Load config with overrides
+    let overrides = cli_config_overrides
+        .parse_overrides()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let cfg = codex_core::config::Config::load_with_cli_overrides(
+        overrides,
+        codex_core::config::ConfigOverrides::default(),
+    )?;
+
+    let (runs, eps) = match codex_memory::graph::ingest::reingest_repo(&cfg.cwd) {
+        Ok(v) => v,
+        Err(e) => anyhow::bail!(format!("Reingest failed: {}", e)),
+    };
+    println!("Reingested graph: runs {} • episodes {}", runs, eps);
     Ok(())
 }
 
@@ -430,9 +520,135 @@ async fn harness_run(
     if let Some(seed) = cmd.seed {
         command.arg("--seed").arg(seed.to_string());
     }
+    if cmd.no_cache {
+        command.arg("--no-cache");
+    }
+    if let Some(ctx) = cmd.context.as_deref() {
+        command.arg("--context").arg(ctx);
+    }
     let status = command.status().await?;
     if !status.success() {
         anyhow::bail!(format!("Harness run failed with status {}", status));
     }
+    Ok(())
+}
+
+async fn debug_inspect_request(
+    cli_config_overrides: CliConfigOverrides,
+    args: InspectRequestArgs,
+) -> anyhow::Result<()> {
+    // Load config with overrides
+    let overrides = cli_config_overrides
+        .parse_overrides()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let cfg = codex_core::config::Config::load_with_cli_overrides(
+        overrides,
+        codex_core::config::ConfigOverrides::default(),
+    )?;
+
+    // Determine auth mode per arg or availability
+    use codex_login::AuthMode;
+    let desired = args
+        .auth_mode
+        .as_deref()
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| "auto".to_string());
+
+    let auth = match desired.as_str() {
+        "chatgpt" => codex_login::CodexAuth::from_codex_home(&cfg.codex_home, AuthMode::ChatGPT)?,
+        "api" | "apikey" => codex_login::CodexAuth::from_codex_home(&cfg.codex_home, AuthMode::ApiKey)?,
+        _ => {
+            // auto: prefer ChatGPT when present, else API key, else none
+            match codex_login::CodexAuth::from_codex_home(&cfg.codex_home, AuthMode::ChatGPT)? {
+                Some(a) => Some(a),
+                None => codex_login::CodexAuth::from_codex_home(&cfg.codex_home, AuthMode::ApiKey)?,
+            }
+        }
+    };
+
+    let auth_mode = auth.as_ref().map(|a| a.mode);
+    // Reconstruct endpoint selection logic locally (mirrors core behavior)
+    let default_base = if matches!(auth_mode, Some(AuthMode::ChatGPT)) {
+        "https://chatgpt.com/backend-api/codex".to_string()
+    } else {
+        "https://api.openai.com/v1".to_string()
+    };
+    let base_url = match auth_mode {
+        Some(AuthMode::ChatGPT) => {
+            match &cfg.model_provider.base_url {
+                Some(url) if url.contains("chatgpt") || url.contains("/codex") => url.clone(),
+                _ => default_base.clone(),
+            }
+        }
+        _ => cfg
+            .model_provider
+            .base_url
+            .clone()
+            .unwrap_or(default_base.clone()),
+    };
+    let wire_api = format!("{:?}", cfg.model_provider.wire_api).to_lowercase();
+    let endpoint = match cfg.model_provider.wire_api {
+        codex_core::WireApi::Responses => format!("{}/responses", base_url),
+        codex_core::WireApi::Chat => format!("{}/chat/completions", base_url),
+    };
+
+    // Indicate which instructions policy would be used
+    let policy = match auth_mode {
+        Some(AuthMode::ChatGPT) => "chatgpt_minimal",
+        Some(AuthMode::ApiKey) => "full",
+        None => "none",
+    };
+
+    // Print a compact JSON diagnostic to stdout (no secrets)
+    let auth_mode_s = auth_mode
+        .map(|m| match m { AuthMode::ChatGPT => "chatgpt", AuthMode::ApiKey => "apikey" })
+        .unwrap_or("none");
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "auth_mode": auth_mode_s,
+            "wire_api": wire_api,
+            "endpoint": endpoint,
+            "instructions_policy": policy,
+        })
+    );
+
+    Ok(())
+}
+
+async fn improve_run(
+    cli_config_overrides: CliConfigOverrides,
+    cmd: ImproveCommand,
+) -> anyhow::Result<()> {
+    // Load config (cwd, policy) from overrides
+    let cfg = codex_core::config::Config::load_with_cli_overrides(
+        cli_config_overrides
+            .parse_overrides()
+            .map_err(|e| anyhow::anyhow!(e))?,
+        codex_core::config::ConfigOverrides::default(),
+    )?;
+
+    let opts = codex_core::orchestrator::ImproveOptions {
+        goal: cmd.goal,
+        max_attempts: cmd.max_attempts.max(1),
+        no_approval: cmd.no_approval,
+        budgets: codex_core::orchestrator::Budgets {
+            wall_time_secs: cmd.wall_time_secs,
+            token_budget: cmd.token_budget,
+            max_concurrency: cmd.concurrency,
+        },
+        context_label: cmd.context,
+    };
+    let res = codex_core::orchestrator::run_improve(&cfg, opts).await?;
+    println!(
+        "Improve: accepted={} attempts={} last={}/{} Δok={} Δerr={}",
+        res.accepted,
+        res.attempts,
+        res.last_run_day.unwrap_or_else(|| "n/a".to_string()),
+        res.last_run_ts.unwrap_or_else(|| "n/a".to_string()),
+        res.delta_ok.map(|v| v.to_string()).unwrap_or_else(|| "n/a".to_string()),
+        res.delta_error.map(|v| v.to_string()).unwrap_or_else(|| "n/a".to_string()),
+    );
     Ok(())
 }

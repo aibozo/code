@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -68,14 +69,39 @@ pub struct AgentManager {
     agents: HashMap<String, Agent>,
     handles: HashMap<String, JoinHandle<()>>,
     event_sender: Option<mpsc::UnboundedSender<Event>>,
+    /// Simple concurrency caps by logical model name (e.g., "gpt-5", "gpt-5-mini").
+    caps_by_model: HashMap<String, usize>,
+    /// Queue of agent IDs waiting to start due to concurrency caps.
+    queued: Vec<String>,
+    /// Minimum pacing interval per model; a new start will wait at least this long since the last start.
+    min_interval_by_model: HashMap<String, std::time::Duration>,
+    /// Last actual start time per model, for pacing.
+    last_started_at_by_model: HashMap<String, std::time::Instant>,
+    /// Agents that have a delayed start scheduled (to avoid duplicate scheduling).
+    scheduled: HashSet<String>,
 }
 
 impl AgentManager {
     pub fn new() -> Self {
+        let mut caps = HashMap::new();
+        // Hard caps per requirements: allow only one GPT‑5 at a time; up to five GPT‑5‑mini.
+        caps.insert("gpt-5".to_string(), 1);
+        caps.insert("gpt-5-mini".to_string(), 5);
+        let mut min_intervals = HashMap::new();
+        // Provider pacing requirements from M7 docs:
+        // - Linearize GPT‑5 (OAuth) with ≥2s spacing between requests
+        // - Pace minis via queue with ≥0.5s spacing
+        min_intervals.insert("gpt-5".to_string(), std::time::Duration::from_millis(2000));
+        min_intervals.insert("gpt-5-mini".to_string(), std::time::Duration::from_millis(500));
         Self {
             agents: HashMap::new(),
             handles: HashMap::new(),
             event_sender: None,
+            caps_by_model: caps,
+            queued: Vec::new(),
+            min_interval_by_model: min_intervals,
+            last_started_at_by_model: HashMap::new(),
+            scheduled: HashSet::new(),
         }
     }
 
@@ -83,7 +109,7 @@ impl AgentManager {
         self.event_sender = Some(sender);
     }
 
-    async fn send_agent_status_update(&self) {
+    fn send_agent_status_update(&self) {
         if let Some(ref sender) = self.event_sender {
             let agents: Vec<AgentInfo> = self
                 .agents
@@ -97,6 +123,13 @@ impl AgentManager {
                         name,
                         status: format!("{:?}", agent.status).to_lowercase(),
                         model: Some(agent.model.clone()),
+                        created_at: Some(agent.created_at.to_rfc3339()),
+                        started_at: agent.started_at.map(|t| t.to_rfc3339()),
+                        completed_at: agent.completed_at.map(|t| t.to_rfc3339()),
+                        error: agent.error.clone(),
+                        progress_tail: Some(agent.progress.iter().rev().take(3).cloned().collect::<Vec<_>>().into_iter().rev().collect()),
+                        worktree_path: agent.worktree_path.clone(),
+                        branch_name: agent.branch_name.clone(),
                     }
                 })
                 .collect();
@@ -119,6 +152,131 @@ impl AgentManager {
             };
 
             let _ = sender.send(event);
+        }
+    }
+
+    /// Returns number of agents currently Running for a specific logical model.
+    fn running_count_for_model(&self, model: &str) -> usize {
+        self.agents
+            .values()
+            .filter(|a| a.model == model && a.status == AgentStatus::Running)
+            .count()
+    }
+
+    /// Try to start the given agent now (respecting caps and pacing).
+    /// Returns true if started immediately, false if queued or scheduled for later.
+    async fn try_start_agent_now(&mut self, agent_id: &str) -> bool {
+        let model = match self.agents.get(agent_id) { Some(a) => a.model.clone(), None => return false };
+        let cap = self.caps_by_model.get(&model).copied().unwrap_or(usize::MAX);
+        let active = self.running_count_for_model(&model);
+        if active >= cap {
+            // Queue the agent; will be started when a slot frees up
+            if !self.queued.iter().any(|id| id == agent_id) {
+                self.queued.push(agent_id.to_string());
+            }
+            return false;
+        }
+        // Determine pacing delay based on last start time for this model
+        let now = std::time::Instant::now();
+        let min_interval = self
+            .min_interval_by_model
+            .get(&model)
+            .copied()
+            .unwrap_or(std::time::Duration::from_millis(0));
+        let delay = if let Some(last) = self.last_started_at_by_model.get(&model) {
+            let elapsed = now.saturating_duration_since(*last);
+            if elapsed < min_interval {
+                min_interval - elapsed
+            } else {
+                std::time::Duration::from_millis(0)
+            }
+        } else {
+            std::time::Duration::from_millis(0)
+        };
+
+        if delay.as_millis() > 0 {
+            // Schedule a delayed start, keep status as Pending until it actually starts
+            if self.scheduled.insert(agent_id.to_string()) {
+                // Add a pacing hint to the agent's progress
+                if let Some(agent) = self.agents.get_mut(agent_id) {
+                    agent.progress.push(format!(
+                        "{}: pacing: waiting {}ms before start (model {})",
+                        Utc::now().format("%H:%M:%S"),
+                        delay.as_millis(),
+                        model
+                    ));
+                }
+                // Emit status update with progress hint
+                self.send_agent_status_update();
+                let agent_id_s = agent_id.to_string();
+                let model_s = model.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    // Re-lock manager and ensure capacity still allows start
+                    let mut mgr = AGENT_MANAGER.write().await;
+                    // If agent no longer present (cancelled), bail
+                    if !mgr.agents.contains_key(&agent_id_s) { return; }
+                    let cap = mgr.caps_by_model.get(&model_s).copied().unwrap_or(usize::MAX);
+                    let active = mgr.running_count_for_model(&model_s);
+                    if active >= cap {
+                        // Move to queue; will be picked up when capacity frees
+                        if !mgr.queued.iter().any(|id| id == &agent_id_s) {
+                            mgr.queued.push(agent_id_s.clone());
+                        }
+                        mgr.scheduled.remove(&agent_id_s);
+                        // Emit status update to reflect queuing
+                        mgr.send_agent_status_update();
+                        return;
+                    }
+                    // Start now
+                    let mut config = None;
+                    if let Some(agent) = mgr.agents.get_mut(&agent_id_s) {
+                        agent.status = AgentStatus::Running;
+                        if agent.started_at.is_none() { agent.started_at = Some(Utc::now()); }
+                        config = agent.config.clone();
+                    }
+                    let agent_id_clone = agent_id_s.clone();
+                    let handle = tokio::spawn(async move { execute_agent(agent_id_clone, config).await });
+                    mgr.handles.insert(agent_id_s.clone(), handle);
+                    mgr.last_started_at_by_model.insert(model_s.clone(), std::time::Instant::now());
+                    mgr.scheduled.remove(&agent_id_s);
+                    mgr.send_agent_status_update();
+                });
+            }
+            return false;
+        }
+
+        // Start immediately
+        let mut config = None;
+        if let Some(agent) = self.agents.get_mut(agent_id) {
+            agent.status = AgentStatus::Running;
+            if agent.started_at.is_none() { agent.started_at = Some(Utc::now()); }
+            config = agent.config.clone();
+        }
+        let agent_id_clone = agent_id.to_string();
+        let handle = tokio::spawn(async move { execute_agent(agent_id_clone, config).await });
+        self.handles.insert(agent_id.to_string(), handle);
+        self.last_started_at_by_model.insert(model.clone(), std::time::Instant::now());
+        self.send_agent_status_update();
+        true
+    }
+
+    /// Attempt to start a queued agent for the given model, if capacity is available.
+    fn maybe_start_next_for_model(&mut self, model: &str) {
+        let cap = self.caps_by_model.get(model).copied().unwrap_or(usize::MAX);
+        if self.running_count_for_model(model) >= cap { return; }
+        if let Some(pos) = self
+            .queued
+            .iter()
+            .position(|id| self.agents.get(id).map(|a| a.model.as_str()) == Some(model))
+        {
+            let id = self.queued.remove(pos);
+            // Defer to the pacing-aware starter
+            // Note: we cannot .await in this method; schedule the start via a detached task
+            tokio::spawn(async move {
+                let mut mgr = AGENT_MANAGER.write().await;
+                let _ = mgr.try_start_agent_now(&id).await;
+            });
         }
     }
 
@@ -205,16 +363,11 @@ impl AgentManager {
 
         self.agents.insert(agent_id.clone(), agent.clone());
 
-        // Send initial status update
-        self.send_agent_status_update().await;
+        // Try to start now (obeys concurrency caps), or queue if over cap
+        let _ = self.try_start_agent_now(&agent_id).await;
 
-        // Spawn async agent
-        let agent_id_clone = agent_id.clone();
-        let handle = tokio::spawn(async move {
-            execute_agent(agent_id_clone, config).await;
-        });
-
-        self.handles.insert(agent_id.clone(), handle);
+        // Send initial status update (pending or running)
+        self.send_agent_status_update();
 
         agent_id
     }
@@ -294,6 +447,7 @@ impl AgentManager {
     }
 
     pub async fn update_agent_status(&mut self, agent_id: &str, status: AgentStatus) {
+        let mut model_to_consider: Option<String> = None;
         if let Some(agent) = self.agents.get_mut(agent_id) {
             agent.status = status;
             if agent.status == AgentStatus::Running && agent.started_at.is_none() {
@@ -304,10 +458,13 @@ impl AgentManager {
                 AgentStatus::Completed | AgentStatus::Failed | AgentStatus::Cancelled
             ) {
                 agent.completed_at = Some(Utc::now());
+                model_to_consider = Some(agent.model.clone());
             }
-            // Send status update event
-            self.send_agent_status_update().await;
         }
+        // Send status update event outside the mutable borrow
+        self.send_agent_status_update();
+        // Capacity freed; queued agents remain pending until a future caller starts them.
+        if let Some(m) = model_to_consider { self.maybe_start_next_for_model(&m); }
     }
 
     pub async fn update_agent_result(&mut self, agent_id: &str, result: Result<String, String>) {
@@ -324,7 +481,7 @@ impl AgentManager {
             }
             agent.completed_at = Some(Utc::now());
             // Send status update event
-            self.send_agent_status_update().await;
+            self.send_agent_status_update();
         }
     }
 
@@ -334,7 +491,7 @@ impl AgentManager {
                 .progress
                 .push(format!("{}: {}", Utc::now().format("%H:%M:%S"), message));
             // Send updated agent status with the latest progress
-            self.send_agent_status_update().await;
+            self.send_agent_status_update();
         }
     }
 
@@ -600,10 +757,24 @@ async fn execute_model_with_permissions(
             }
         }
         "codex" => {
+            // Respect preconfigured sandbox/approval flags in config args when present.
+            let mut has_s = false;
+            let mut has_a = false;
+            if let Some(ref cfg) = config {
+                let mut iter = cfg.args.iter();
+                while let Some(a) = iter.next() {
+                    if a == "-s" { has_s = true; /* skip value inspection */ }
+                    if a == "-a" { has_a = true; }
+                }
+            }
             if read_only {
-                cmd.args(&["-s", "read-only", "-a", "never", "exec", prompt]);
+                if !has_s { cmd.args(&["-s", "read-only"]); }
+                if !has_a { cmd.args(&["-a", "never"]); }
+                cmd.args(&["exec", prompt]);
             } else {
-                cmd.args(&["-s", "workspace-write", "-a", "never", "exec", prompt]);
+                if !has_s { cmd.args(&["-s", "workspace-write"]); }
+                if !has_a { cmd.args(&["-a", "on-request"]); }
+                cmd.args(&["exec", prompt]);
             }
         }
         _ => {

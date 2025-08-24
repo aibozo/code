@@ -26,6 +26,7 @@ mod environment_context;
 pub mod error;
 pub mod exec;
 pub mod exec_env;
+pub mod enforcement_advisor;
 mod flags;
 pub mod git_info;
 mod image_comparison;
@@ -49,6 +50,8 @@ mod models;
 mod openai_model_info;
 mod openai_tools;
 pub mod plan_tool;
+pub mod phase_tools;
+pub mod orchestrator;
 pub mod project_doc;
 mod rollout;
 pub(crate) mod safety;
@@ -68,6 +71,7 @@ pub mod protocol;
 // Optionally expose upstream protocol config enums for callers that need them.
 pub use codex_protocol::config_types as protocol_config_types;
 pub mod memory;
+pub mod research;
 // Re-export common model types for integration tests and consumers
 pub use models::ContentItem;
 pub use models::FunctionCallOutputPayload;

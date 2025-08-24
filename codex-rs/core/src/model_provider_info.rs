@@ -132,23 +132,26 @@ impl ModelProviderInfo {
     }
 
     pub(crate) fn get_full_url(&self, auth: &Option<CodexAuth>) -> String {
-        let default_base_url = if matches!(
-            auth,
-            Some(CodexAuth {
-                mode: AuthMode::ChatGPT,
-                ..
-            })
-        ) {
+        // Choose reasonable defaults for each auth mode.
+        let default_base_url = if matches!(auth, Some(CodexAuth { mode: AuthMode::ChatGPT, .. })) {
             "https://chatgpt.com/backend-api/codex"
         } else {
             "https://api.openai.com/v1"
         };
-        let query_string = self.get_query_string();
-        let base_url = self
-            .base_url
-            .clone()
-            .unwrap_or(default_base_url.to_string());
 
+        // For ChatGPT OAuth, prefer the ChatGPT CODEx endpoint unless the provider was
+        // explicitly configured to point to a CODEx‑like path (used in tests/mocks).
+        let base_url = match auth {
+            Some(CodexAuth { mode: AuthMode::ChatGPT, .. }) => {
+                match &self.base_url {
+                    Some(url) if url.contains("chatgpt") || url.contains("/codex") => url.clone(),
+                    _ => default_base_url.to_string(),
+                }
+            }
+            _ => self.base_url.clone().unwrap_or(default_base_url.to_string()),
+        };
+
+        let query_string = self.get_query_string();
         match self.wire_api {
             WireApi::Responses => format!("{base_url}/responses{query_string}"),
             WireApi::Chat => format!("{base_url}/chat/completions{query_string}"),

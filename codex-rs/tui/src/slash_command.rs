@@ -12,6 +12,9 @@ use strum_macros::IntoStaticStr;
 pub enum SlashCommand {
     // DO NOT ALPHA-SORT! Enum order is presentation order in the popup, so
     // more frequently used commands should be listed first.
+    Tgm,
+    Checkpoint,
+    Relaunch,
     Browser,
     Chrome,
     New,
@@ -27,10 +30,18 @@ pub enum SlashCommand {
     Perf,
     Memory,
     Harness,
+    Loop,
+    Improve,
     Reports,
+    Safety,
+    Approvals,
+    Accept,
+    Revert,
     // Prompt-expanding commands
     Plan,
+    Act,
     Solve,
+    Reflect,
     Code,
     Logout,
     Quit,
@@ -42,10 +53,15 @@ impl SlashCommand {
     /// User-visible description shown in the popup.
     pub fn description(self) -> &'static str {
         match self {
+            SlashCommand::Tgm => "toggle GODMODE (/tgm on|off|status)",
+            SlashCommand::Checkpoint => "create a checkpoint (M6)",
+            SlashCommand::Relaunch => "restore a checkpoint (M6)",
             SlashCommand::Chrome => "connect to Chrome",
             SlashCommand::Browser => "open internal browser",
             SlashCommand::Plan => "create a comprehensive plan (multiple agents)",
+            SlashCommand::Act => "implement changes via apply_patch (respect approvals)",
             SlashCommand::Solve => "solve a challenging problem (multiple agents)",
+            SlashCommand::Reflect => "summarize results and next steps",
             SlashCommand::Code => "perform a coding task (multiple agents)",
             SlashCommand::Reasoning => "change reasoning effort (minimal/low/medium/high)",
             SlashCommand::Verbosity => "change text verbosity (high/medium/low)",
@@ -61,8 +77,14 @@ impl SlashCommand {
             SlashCommand::Perf => "performance tracing (on/off/show/reset)",
             SlashCommand::Memory => "configure memory (keep-last, summary)",
             SlashCommand::Harness => "run the evaluation harness",
+            SlashCommand::Loop => "manage the perpetual self-improvement loop",
+            SlashCommand::Improve => "run orchestrator improvement cycle (M4)",
             SlashCommand::Logout => "log out of Codex",
             SlashCommand::Reports => "show harness reports",
+            SlashCommand::Safety => "show safety status and recent logs",
+            SlashCommand::Approvals => "manage pending approvals (approve/deny)",
+            SlashCommand::Accept => "accept current session changes",
+            SlashCommand::Revert => "revert current session changes",
             #[cfg(debug_assertions)]
             SlashCommand::TestApproval => "test approval request",
         }
@@ -78,7 +100,7 @@ impl SlashCommand {
     pub fn is_prompt_expanding(self) -> bool {
         matches!(
             self,
-            SlashCommand::Plan | SlashCommand::Solve | SlashCommand::Code
+            SlashCommand::Plan | SlashCommand::Act | SlashCommand::Solve | SlashCommand::Reflect | SlashCommand::Code
         )
     }
 
@@ -104,9 +126,40 @@ impl SlashCommand {
             SlashCommand::Plan => Some(codex_core::slash_commands::format_plan_command(
                 args, None, None,
             )),
+            // Encourage the model to use the apply_patch tool with unified diffs and respect approvals.
+            SlashCommand::Act => Some({
+                let task = args;
+                format!(
+                    concat!(
+                        "Act on the following task by proposing minimal, focused code changes.\n",
+                        "Use the apply_patch tool to provide a unified diff (git-style) patch.\n",
+                        "Constraints:\n",
+                        "- Keep diffs small, scoped, and reversible.\n",
+                        "- Include file adds/updates/moves only as needed.\n",
+                        "- Respect approval policy; do not bypass sandboxing.\n",
+                        "- Provide only the patch via the tool; keep prose in assistant output concise.\n",
+                        "- End your turn when you are confident in the proposed change set.\n",
+                        "- Do not wait for time-based events or long-running loops.\n",
+                        "Task:\n{}\n"
+                    ),
+                    task
+                )
+            }),
             SlashCommand::Solve => Some(codex_core::slash_commands::format_solve_command(
                 args, None, None,
             )),
+            SlashCommand::Reflect => Some({
+                let topic = args;
+                format!(
+                    concat!(
+                        "Reflect on the latest harness run and recent edits.\n",
+                        "Summarize outcomes (passes, failures, cached stages), key changes, and propose next targets.\n",
+                        "Be concise and actionable; end the turn when your reflection is complete.\n",
+                        "Topic/context:\n{}\n"
+                    ),
+                    topic
+                )
+            }),
             SlashCommand::Code => Some(codex_core::slash_commands::format_code_command(
                 args, None, None,
             )),
